@@ -1,0 +1,16 @@
+target/
+.idea/
+*.iml
+
+# 压测生成数据和输出文件体积很大，不进入代码仓库。
+perf_data_*.csv
+contest-output-*/
+contest-lowcache-output-*/
+perf-output-*/
+loadtime-output-*/
+loadtime-*.log
+output/
+
+# 本地运行临时文件。
+*.tmp
+*.log

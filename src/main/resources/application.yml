@@ -1,0 +1,17 @@
+server:
+  port: 8080
+
+dcc:
+  team-code: team16
+  dataset-path: table_data_baseline.csv
+  output-dir: output
+  callback-url: ""
+  worker-threads: 3
+  queue-capacity: 128
+  expected-rows: 300000
+  initial-raw-pool-bytes: 67108864
+  initial-mask-pool-bytes: 16777216
+  output-buffer-bytes: 1048576
+  cache-capacity: 524288
+  request-timeout-millis: 120000
+  baseline-validation-enabled: false
