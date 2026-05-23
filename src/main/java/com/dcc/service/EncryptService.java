@@ -143,11 +143,6 @@ public class EncryptService {
             try (OutputStream out = Files.newOutputStream(output)) {
                 FastCsvWriter writer = new FastCsvWriter(out, properties.getOutputBufferBytes());
                 for (int row = 0; row < data.rows(); row++) {
-                    if (row > 0) {
-                        // baseline 使用 CRLF 且文件末尾不额外追加空行。
-                        writer.writeByte('\r');
-                        writer.writeByte('\n');
-                    }
                     for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
                         if (fieldIndex > 0) {
                             writer.writeByte(',');
@@ -171,6 +166,8 @@ public class EncryptService {
                             writer.writeBytes(cellBuffer, 0, hexLength);
                         }
                     }
+                    // Baseline output terminates every CSV row with LF, including the final row.
+                    writer.writeByte('\n');
                 }
                 // 验证程序收到回调后会立即读文件，因此必须先 flush，并依靠 try-with-resources 完成 close。
                 writer.flush();
