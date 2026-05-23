@@ -176,17 +176,16 @@ public class EncryptService {
 
         private RequestEncryptedDictionary[] buildEncryptedDictionaries(LoadedData data, Sm4Cipher.Context cipher) {
             RequestEncryptedDictionary[] encrypted = new RequestEncryptedDictionary[FieldId.FIELD_COUNT];
-            byte[] tempBuffer = new byte[256];
             for (int i = 0; i < fieldCount; i++) {
                 int fieldId = fields[i];
                 if (data.hasDictionary(fieldId)) {
-                    encrypted[fieldId] = encryptDictionary(data.dictionary(fieldId), cipher, tempBuffer);
+                    encrypted[fieldId] = encryptDictionary(data.dictionary(fieldId), cipher);
                 }
             }
             return encrypted;
         }
 
-        private RequestEncryptedDictionary encryptDictionary(DictionaryColumnData dictionary, Sm4Cipher.Context cipher, byte[] tempBuffer) {
+        private RequestEncryptedDictionary encryptDictionary(DictionaryColumnData dictionary, Sm4Cipher.Context cipher) {
             int uniqueCount = dictionary.uniqueCount();
             int[] offsets = new int[uniqueCount];
             int[] lengths = new int[uniqueCount];
@@ -199,8 +198,7 @@ public class EncryptService {
             byte[] source = dictionary.bytes();
             for (int i = 0; i < uniqueCount; i++) {
                 offsets[i] = position;
-                int hexLength = cipher.encryptToHex(source, dictionary.uniqueOffset(i), dictionary.uniqueLength(i), tempBuffer, 0);
-                System.arraycopy(tempBuffer, 0, encryptedBytes, position, hexLength);
+                int hexLength = cipher.encryptToHex(source, dictionary.uniqueOffset(i), dictionary.uniqueLength(i), encryptedBytes, position);
                 lengths[i] = hexLength;
                 position += hexLength;
             }
