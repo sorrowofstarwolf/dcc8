@@ -77,6 +77,9 @@ public class EncryptService {
     public Path generateBlocking(EncryptRequest request) {
         int[] fields = new int[FieldId.MAX_REQUEST_FIELDS];
         String[] names = request.getFieldsToEncrypt();
+        if (names == null || names.length == 0 || names.length > FieldId.MAX_REQUEST_FIELDS) {
+            throw new IllegalArgumentException("fieldsToEncrypt length must be 1.." + FieldId.MAX_REQUEST_FIELDS);
+        }
         for (int i = 0; i < names.length; i++) {
             fields[i] = FieldId.fromName(names[i]);
         }
