@@ -40,6 +40,6 @@ public final class FieldId {
     }
 
     public static boolean shouldCache(int fieldId) {
-        return fieldId == USER_ID || fieldId == USER_CODE || fieldId == SECRET_CODE;
+        return fieldId == USER_ID || fieldId == USER_CODE;
     }
 }
