@@ -12,14 +12,15 @@ public final class ColumnData {
         this.lengths = new int[rows];
     }
 
-    void put(int row, byte[] source, int offset, int length) {
+    int put(int row, byte[] source, int offset, int length) {
         // 加载阶段完成一次复制，后续请求直接按偏移读取，不再解析 CSV 或生成字段字符串。
         offsets[row] = pool.append(source, offset, length);
         lengths[row] = length;
+        return offsets[row];
     }
 
-    void put(int row, byte[] source) {
-        put(row, source, 0, source.length);
+    int put(int row, byte[] source) {
+        return put(row, source, 0, source.length);
     }
 
     public byte[] bytes() {

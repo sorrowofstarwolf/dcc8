@@ -26,5 +26,7 @@ class DataStoreTest {
         assertThat(first.rows()).isEqualTo(10);
         ColumnData userCode = first.column(FieldId.USER_CODE);
         assertThat(new String(userCode.bytes(), userCode.offset(0), userCode.length(0), StandardCharsets.UTF_8)).isEqualTo("CZJE");
+        assertThat(first.hasDictionary(FieldId.USER_CODE)).isTrue();
+        assertThat(first.dictionary(FieldId.USER_CODE).uniqueCount()).isEqualTo(10);
     }
 }

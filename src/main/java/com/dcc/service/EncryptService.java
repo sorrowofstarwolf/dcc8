@@ -9,6 +9,7 @@ import com.dcc.model.CallbackRequest;
 import com.dcc.model.EncryptRequest;
 import com.dcc.store.ColumnData;
 import com.dcc.store.DataStore;
+import com.dcc.store.DictionaryColumnData;
 import com.dcc.store.LoadedData;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,7 +18,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PreDestroy;
-import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
@@ -131,21 +131,23 @@ public class EncryptService {
         private void writeFile(LoadedData data, Path output) throws IOException {
             // 每个请求一个 SM4 Context，因为 sm4Key 随请求变化；同一请求内复用该 Context。
             Sm4Cipher.Context cipher = sm4Cipher.newContext(sm4Key);
+            RequestEncryptedDictionary[] encryptedDictionaries = buildEncryptedDictionaries(data, cipher);
             // caches 按字段懒创建，仅低基数字段启用，避免高基数字段缓存开销超过收益。
             FixedCipherCache[] caches = new FixedCipherCache[FieldId.FIELD_COUNT];
             // cellBuffer/tempBuffer 是请求级复用缓冲，避免每个单元格创建密文数组或 HEX 字符串。
             byte[] cellBuffer = new byte[256];
             byte[] tempBuffer = new byte[256];
-            try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(output), properties.getOutputBufferBytes())) {
+            try (OutputStream out = Files.newOutputStream(output)) {
+                FastCsvWriter writer = new FastCsvWriter(out, properties.getOutputBufferBytes());
                 for (int row = 0; row < data.rows(); row++) {
                     if (row > 0) {
                         // baseline 使用 CRLF 且文件末尾不额外追加空行。
-                        out.write('\r');
-                        out.write('\n');
+                        writer.writeByte('\r');
+                        writer.writeByte('\n');
                     }
                     for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
                         if (fieldIndex > 0) {
-                            out.write(',');
+                            writer.writeByte(',');
                         }
                         int fieldId = fields[fieldIndex];
                         ColumnData column = data.column(fieldId);
@@ -154,16 +156,70 @@ public class EncryptService {
                         int length = column.length(row);
                         if (FieldId.isMaskField(fieldId)) {
                             // 掩码字段已经在加载时预计算，直接从列式字节池写出。
-                            out.write(bytes, offset, length);
+                            writer.writeBytes(bytes, offset, length);
+                        } else if (encryptedDictionaries[fieldId] != null) {
+                            RequestEncryptedDictionary encryptedDictionary = encryptedDictionaries[fieldId];
+                            DictionaryColumnData dictionary = data.dictionary(fieldId);
+                            int valueId = dictionary.rowValueId(row);
+                            writer.writeBytes(encryptedDictionary.bytes, encryptedDictionary.offsets[valueId], encryptedDictionary.lengths[valueId]);
                         } else {
                             // SM4 字段按当前请求密钥即时加密，密文直接写入输出流。
                             int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer, tempBuffer);
-                            out.write(cellBuffer, 0, hexLength);
+                            writer.writeBytes(cellBuffer, 0, hexLength);
                         }
                     }
                 }
                 // 验证程序收到回调后会立即读文件，因此必须先 flush，并依靠 try-with-resources 完成 close。
-                out.flush();
+                writer.flush();
+            }
+        }
+
+        private RequestEncryptedDictionary[] buildEncryptedDictionaries(LoadedData data, Sm4Cipher.Context cipher) {
+            RequestEncryptedDictionary[] encrypted = new RequestEncryptedDictionary[FieldId.FIELD_COUNT];
+            byte[] tempBuffer = new byte[256];
+            for (int i = 0; i < fieldCount; i++) {
+                int fieldId = fields[i];
+                if (data.hasDictionary(fieldId)) {
+                    encrypted[fieldId] = encryptDictionary(data.dictionary(fieldId), cipher, tempBuffer);
+                }
+            }
+            return encrypted;
+        }
+
+        private RequestEncryptedDictionary encryptDictionary(DictionaryColumnData dictionary, Sm4Cipher.Context cipher, byte[] tempBuffer) {
+            int uniqueCount = dictionary.uniqueCount();
+            int[] offsets = new int[uniqueCount];
+            int[] lengths = new int[uniqueCount];
+            int totalBytes = 0;
+            for (int i = 0; i < uniqueCount; i++) {
+                totalBytes += encryptedHexLength(dictionary.uniqueLength(i));
+            }
+            byte[] encryptedBytes = new byte[totalBytes];
+            int position = 0;
+            byte[] source = dictionary.bytes();
+            for (int i = 0; i < uniqueCount; i++) {
+                offsets[i] = position;
+                int hexLength = cipher.encryptToHex(source, dictionary.uniqueOffset(i), dictionary.uniqueLength(i), tempBuffer, 0);
+                System.arraycopy(tempBuffer, 0, encryptedBytes, position, hexLength);
+                lengths[i] = hexLength;
+                position += hexLength;
+            }
+            return new RequestEncryptedDictionary(encryptedBytes, offsets, lengths);
+        }
+
+        private int encryptedHexLength(int plainLength) {
+            return ((plainLength / 16) + 1) * 32;
+        }
+
+        private final class RequestEncryptedDictionary {
+            private final byte[] bytes;
+            private final int[] offsets;
+            private final int[] lengths;
+
+            private RequestEncryptedDictionary(byte[] bytes, int[] offsets, int[] lengths) {
+                this.bytes = bytes;
+                this.offsets = offsets;
+                this.lengths = lengths;
             }
         }
 

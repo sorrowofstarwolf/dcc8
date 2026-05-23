@@ -27,7 +27,7 @@ public final class FixedCipherCache {
 
     public int get(byte[] keyBytes, int keyOffset, int keyLength, int hash, byte[] target, int targetOffset) {
         int slot = hash & mask;
-        while (hashes[slot] != 0) {
+        for (int probes = 0; probes < hashes.length && hashes[slot] != 0; probes++) {
             // hash 命中后仍比较长度和原文字节，避免哈希碰撞导致密文错误。
             if (hashes[slot] == hash && keyLengths[slot] == keyLength && equals(keyBytes, keyOffset, keyOffsets[slot], keyLength)) {
                 int valueOffset = valueOffsets[slot];
@@ -46,11 +46,14 @@ public final class FixedCipherCache {
             return;
         }
         int slot = hash & mask;
-        while (hashes[slot] != 0) {
+        for (int probes = 0; probes < hashes.length && hashes[slot] != 0; probes++) {
             if (hashes[slot] == hash && keyLengths[slot] == keyLength && equals(keyBytes, keyOffset, keyOffsets[slot], keyLength)) {
                 return;
             }
             slot = (slot + 1) & mask;
+        }
+        if (hashes[slot] != 0) {
+            return;
         }
         hashes[slot] = hash == 0 ? 1 : hash;
         // keyOffset 指向全局列式字节池，缓存只记录偏移和长度，不复制原文字段。

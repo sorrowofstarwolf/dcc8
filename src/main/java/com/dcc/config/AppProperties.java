@@ -15,6 +15,7 @@ public class AppProperties {
     private int initialMaskPoolBytes = 16 * 1024 * 1024;
     private int outputBufferBytes = 1024 * 1024;
     private int cacheCapacity = 524288;
+    private boolean dictionaryEnabled = true;
     private int requestTimeoutMillis = 120000;
     private boolean baselineValidationEnabled = false;
 
@@ -40,6 +41,8 @@ public class AppProperties {
     public void setOutputBufferBytes(int outputBufferBytes) { this.outputBufferBytes = outputBufferBytes; }
     public int getCacheCapacity() { return cacheCapacity; }
     public void setCacheCapacity(int cacheCapacity) { this.cacheCapacity = cacheCapacity; }
+    public boolean isDictionaryEnabled() { return dictionaryEnabled; }
+    public void setDictionaryEnabled(boolean dictionaryEnabled) { this.dictionaryEnabled = dictionaryEnabled; }
     public int getRequestTimeoutMillis() { return requestTimeoutMillis; }
     public void setRequestTimeoutMillis(int requestTimeoutMillis) { this.requestTimeoutMillis = requestTimeoutMillis; }
     public boolean isBaselineValidationEnabled() { return baselineValidationEnabled; }

@@ -47,10 +47,14 @@ public class DataStore {
         BytePool rawPool = new BytePool(properties.getInitialRawPoolBytes());
         BytePool maskPool = new BytePool(properties.getInitialMaskPoolBytes());
         ColumnData[] columns = new ColumnData[FieldId.FIELD_COUNT];
+        DictionaryColumnData[] dictionaries = new DictionaryColumnData[FieldId.FIELD_COUNT];
         for (int i = 0; i < columns.length; i++) {
             // SM4 字段进入 rawPool 保存原文；掩码字段进入 maskPool 保存最终脱敏结果。
             // 所有列共用两个预分配池，避免 30 万行 * 11 字段产生大量 byte[] 或 String。
             columns[i] = new ColumnData(FieldId.isMaskField(i) ? maskPool : rawPool, expectedRows);
+            if (properties.isDictionaryEnabled() && FieldId.shouldCache(i)) {
+                dictionaries[i] = new DictionaryColumnData(rawPool.array(), expectedRows);
+            }
         }
 
         // 单行缓冲固定为 4KB，匹配题目字段最大长度；如果正式数据行更长，应调大该常量而不是运行时扩容。
@@ -69,7 +73,7 @@ public class DataStore {
                 if (row >= expectedRows) {
                     throw new IllegalStateException("Dataset row count exceeds dcc.expectedRows");
                 }
-                parseLine(row, line, len, columns);
+                parseLine(row, line, len, columns, dictionaries);
                 row++;
             }
         } catch (IOException e) {
@@ -77,10 +81,15 @@ public class DataStore {
         }
         long millis = (System.nanoTime() - start) / 1_000_000L;
         log.info("Loaded dataset rows={}, rawPoolUsed={}, maskPoolUsed={}, millis={}", row, rawPool.position(), maskPool.position(), millis);
-        return new LoadedData(columns, row);
+        for (int i = 0; i < dictionaries.length; i++) {
+            if (dictionaries[i] != null) {
+                log.info("Dictionary field={}, uniqueValues={}", i, dictionaries[i].uniqueCount());
+            }
+        }
+        return new LoadedData(columns, dictionaries, row);
     }
 
-    private void parseLine(int row, byte[] line, int length, ColumnData[] columns) {
+    private void parseLine(int row, byte[] line, int length, ColumnData[] columns, DictionaryColumnData[] dictionaries) {
         int field = 0;
         int start = 0;
         // 题目数据无复杂 CSV 转义，使用逗号扫描比通用 CSV 解析器更少对象、更少分支。
@@ -96,7 +105,11 @@ public class DataStore {
                     columns[field].put(row, masked);
                 } else {
                     // SM4 字段必须随请求密钥变化，只能保存原始 UTF-8 字节，不能提前加密。
-                    columns[field].put(row, line, start, fieldLen);
+                    int poolOffset = columns[field].put(row, line, start, fieldLen);
+                    DictionaryColumnData dictionary = dictionaries[field];
+                    if (dictionary != null) {
+                        dictionary.addRowValue(row, line, start, fieldLen, poolOffset);
+                    }
                 }
                 field++;
                 start = i + 1;

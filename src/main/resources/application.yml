@@ -13,5 +13,6 @@ dcc:
   initial-mask-pool-bytes: 16777216
   output-buffer-bytes: 1048576
   cache-capacity: 524288
+  dictionary-enabled: true
   request-timeout-millis: 120000
   baseline-validation-enabled: false
