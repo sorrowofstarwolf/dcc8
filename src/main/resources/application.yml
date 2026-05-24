@@ -8,6 +8,8 @@ dcc:
   callback-url: ""
   worker-threads: 3
   queue-capacity: 128
+  callback-threads: 4
+  callback-queue-capacity: 128
   expected-rows: 300000
   initial-raw-pool-bytes: 67108864
   initial-mask-pool-bytes: 16777216

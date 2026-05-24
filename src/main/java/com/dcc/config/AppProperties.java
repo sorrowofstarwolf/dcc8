@@ -10,6 +10,8 @@ public class AppProperties {
     private String callbackUrl = "";
     private int workerThreads = 3;
     private int queueCapacity = 128;
+    private int callbackThreads = 4;
+    private int callbackQueueCapacity = 128;
     private int expectedRows = 300000;
     private int initialRawPoolBytes = 64 * 1024 * 1024;
     private int initialMaskPoolBytes = 16 * 1024 * 1024;
@@ -31,6 +33,10 @@ public class AppProperties {
     public void setWorkerThreads(int workerThreads) { this.workerThreads = workerThreads; }
     public int getQueueCapacity() { return queueCapacity; }
     public void setQueueCapacity(int queueCapacity) { this.queueCapacity = queueCapacity; }
+    public int getCallbackThreads() { return callbackThreads; }
+    public void setCallbackThreads(int callbackThreads) { this.callbackThreads = callbackThreads; }
+    public int getCallbackQueueCapacity() { return callbackQueueCapacity; }
+    public void setCallbackQueueCapacity(int callbackQueueCapacity) { this.callbackQueueCapacity = callbackQueueCapacity; }
     public int getExpectedRows() { return expectedRows; }
     public void setExpectedRows(int expectedRows) { this.expectedRows = expectedRows; }
     public int getInitialRawPoolBytes() { return initialRawPoolBytes; }

@@ -19,7 +19,6 @@ import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PreDestroy;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -35,6 +34,7 @@ public class EncryptService {
     private final Sm4Cipher sm4Cipher;
     private final RestTemplate restTemplate;
     private final ThreadPoolExecutor executor;
+    private final ThreadPoolExecutor callbackExecutor;
 
     public EncryptService(AppProperties properties, DataStore dataStore, Sm4Cipher sm4Cipher) {
         this.properties = properties;
@@ -44,8 +44,6 @@ public class EncryptService {
         requestFactory.setConnectTimeout(properties.getRequestTimeoutMillis());
         requestFactory.setReadTimeout(properties.getRequestTimeoutMillis());
         this.restTemplate = new RestTemplate(requestFactory);
-        // 固定小线程池用于削峰：HTTP 可以同时进来 100 个请求，但真正执行加密的线程保持在配置值。
-        // 这样可以减少线程切换、GC 压力和磁盘写入争抢，通常比 100 个任务同时跑更快。
         this.executor = new ThreadPoolExecutor(
                 properties.getWorkerThreads(),
                 properties.getWorkerThreads(),
@@ -58,10 +56,21 @@ public class EncryptService {
                     return thread;
                 },
                 new ThreadPoolExecutor.CallerRunsPolicy());
+        this.callbackExecutor = new ThreadPoolExecutor(
+                properties.getCallbackThreads(),
+                properties.getCallbackThreads(),
+                0L,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(properties.getCallbackQueueCapacity()),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "dcc-callback-worker");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                new ThreadPoolExecutor.CallerRunsPolicy());
     }
 
     public void submit(EncryptRequest request) {
-        // 请求字段最多 7 个，直接使用固定长度 int[] 保存字段编号，避免热路径 List/Map 分配。
         int[] fields = new int[FieldId.MAX_REQUEST_FIELDS];
         String[] names = request.getFieldsToEncrypt();
         if (names == null || names.length == 0 || names.length > FieldId.MAX_REQUEST_FIELDS) {
@@ -70,7 +79,6 @@ public class EncryptService {
         for (int i = 0; i < names.length; i++) {
             fields[i] = FieldId.fromName(names[i]);
         }
-        // 任务对象是每个请求允许创建的少量对象之一；真正的大量行处理在任务内部复用缓冲区。
         executor.execute(new EncryptTask(request.getRequestId(), request.getSm4Key(), request.getIp(), fields, names.length));
     }
 
@@ -89,6 +97,7 @@ public class EncryptService {
     @PreDestroy
     public void shutdown() {
         executor.shutdown();
+        callbackExecutor.shutdown();
     }
 
     private final class EncryptTask implements Runnable {
@@ -113,15 +122,13 @@ public class EncryptService {
 
         private Path call(boolean doCallback) {
             long start = System.nanoTime();
-            // 首次请求会在这里触发 DataStore 惰性加载；后续请求拿到同一个 LoadedData。
             LoadedData data = dataStore.get();
             Path output = Paths.get(properties.getOutputDir(), requestId + ".csv");
             try {
                 Files.createDirectories(output.getParent());
                 writeFile(data, output);
                 if (doCallback) {
-                    // 文件写完并关闭后再回调，避免验证程序读到半写入文件。
-                    callback();
+                    submitCallback();
                 }
                 long millis = (System.nanoTime() - start) / 1_000_000L;
                 log.info("requestId={}, fields={}, keyLength={}, rows={}, millis={}", requestId, fieldCount, sm4Key == null ? 0 : sm4Key.length(), data.rows(), millis);
@@ -132,46 +139,66 @@ public class EncryptService {
         }
 
         private void writeFile(LoadedData data, Path output) throws IOException {
-            // 每个请求一个 SM4 Context，因为 sm4Key 随请求变化；同一请求内复用该 Context。
             Sm4Cipher.Context cipher = sm4Cipher.newContext(sm4Key);
             RequestEncryptedDictionary[] encryptedDictionaries = buildEncryptedDictionaries(data, cipher);
-            // caches 按字段懒创建，仅低基数字段启用，避免高基数字段缓存开销超过收益。
             FixedCipherCache[] caches = new FixedCipherCache[FieldId.FIELD_COUNT];
-            // cellBuffer/tempBuffer 是请求级复用缓冲，避免每个单元格创建密文数组或 HEX 字符串。
-            byte[] cellBuffer = new byte[256];
             byte[] tempBuffer = new byte[256];
-            try (OutputStream out = Files.newOutputStream(output)) {
-                FastCsvWriter writer = new FastCsvWriter(out, properties.getOutputBufferBytes());
-                for (int row = 0; row < data.rows(); row++) {
-                    for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
-                        if (fieldIndex > 0) {
-                            writer.writeByte(',');
-                        }
-                        int fieldId = fields[fieldIndex];
-                        ColumnData column = data.column(fieldId);
-                        byte[] bytes = column.bytes();
-                        int offset = column.offset(row);
-                        int length = column.length(row);
-                        if (FieldId.isMaskField(fieldId)) {
-                            // 掩码字段已经在加载时预计算，直接从列式字节池写出。
-                            writer.writeBytes(bytes, offset, length);
-                        } else if (encryptedDictionaries[fieldId] != null) {
-                            RequestEncryptedDictionary encryptedDictionary = encryptedDictionaries[fieldId];
-                            DictionaryColumnData dictionary = data.dictionary(fieldId);
-                            int valueId = dictionary.rowValueId(row);
-                            writer.writeBytes(encryptedDictionary.bytes, encryptedDictionary.offsets[valueId], encryptedDictionary.lengths[valueId]);
-                        } else {
-                            // SM4 字段按当前请求密钥即时加密，密文直接写入输出流。
-                            int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer, tempBuffer);
-                            writer.writeBytes(cellBuffer, 0, hexLength);
-                        }
+            byte[] outputBytes = new byte[estimateOutputLength(data, encryptedDictionaries)];
+            int position = 0;
+            for (int row = 0; row < data.rows(); row++) {
+                for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
+                    if (fieldIndex > 0) {
+                        outputBytes[position++] = ',';
                     }
-                    // Baseline output terminates every CSV row with LF, including the final row.
-                    writer.writeByte('\n');
+                    int fieldId = fields[fieldIndex];
+                    ColumnData column = data.column(fieldId);
+                    byte[] bytes = column.bytes();
+                    int offset = column.offset(row);
+                    int length = column.length(row);
+                    if (FieldId.isMaskField(fieldId)) {
+                        System.arraycopy(bytes, offset, outputBytes, position, length);
+                        position += length;
+                    } else if (encryptedDictionaries[fieldId] != null) {
+                        RequestEncryptedDictionary encryptedDictionary = encryptedDictionaries[fieldId];
+                        DictionaryColumnData dictionary = data.dictionary(fieldId);
+                        int valueId = dictionary.rowValueId(row);
+                        int encryptedOffset = encryptedDictionary.offsets[valueId];
+                        int encryptedLength = encryptedDictionary.lengths[valueId];
+                        System.arraycopy(encryptedDictionary.bytes, encryptedOffset, outputBytes, position, encryptedLength);
+                        position += encryptedLength;
+                    } else {
+                        int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, outputBytes, position, tempBuffer);
+                        position += hexLength;
+                    }
                 }
-                // 验证程序收到回调后会立即读文件，因此必须先 flush，并依靠 try-with-resources 完成 close。
-                writer.flush();
+                outputBytes[position++] = '\n';
             }
+            Files.write(output, outputBytes);
+        }
+
+        private int estimateOutputLength(LoadedData data, RequestEncryptedDictionary[] encryptedDictionaries) {
+            long total = (long) data.rows() * fieldCount;
+            for (int row = 0; row < data.rows(); row++) {
+                for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
+                    int fieldId = fields[fieldIndex];
+                    ColumnData column = data.column(fieldId);
+                    int length = column.length(row);
+                    if (FieldId.isMaskField(fieldId)) {
+                        total += length;
+                    } else if (encryptedDictionaries[fieldId] != null) {
+                        RequestEncryptedDictionary encryptedDictionary = encryptedDictionaries[fieldId];
+                        DictionaryColumnData dictionary = data.dictionary(fieldId);
+                        int valueId = dictionary.rowValueId(row);
+                        total += encryptedDictionary.lengths[valueId];
+                    } else {
+                        total += encryptedHexLength(length);
+                    }
+                }
+            }
+            if (total > Integer.MAX_VALUE) {
+                throw new IllegalStateException("Output file is too large to buffer in one byte array: " + total);
+            }
+            return (int) total;
         }
 
         private RequestEncryptedDictionary[] buildEncryptedDictionaries(LoadedData data, Sm4Cipher.Context cipher) {
@@ -221,27 +248,23 @@ public class EncryptService {
             }
         }
 
-        private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches, byte[] bytes, int offset, int length, byte[] output, byte[] temp) {
+        private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches, byte[] bytes, int offset, int length, byte[] output, int targetOffset, byte[] temp) {
             if (!FieldId.shouldCache(fieldId)) {
-                // 高基数字段重复率低，直接加密通常比查缓存更划算。
-                return cipher.encryptToHex(bytes, offset, length, output, 0);
+                return cipher.encryptToHex(bytes, offset, length, output, targetOffset);
             }
             FixedCipherCache cache = caches[fieldId];
             if (cache == null) {
                 int valueBytes = Math.max(1024 * 1024, properties.getCacheCapacity() * 64);
-                // 缓存容量一次性确定，不使用 HashMap，避免节点对象和运行期扩容。
                 cache = new FixedCipherCache(properties.getCacheCapacity(), valueBytes);
                 caches[fieldId] = cache;
             }
             int hash = Hashing.hash(bytes, offset, length);
-            int cached = cache.get(bytes, offset, length, hash, output, 0);
+            int cached = cache.get(bytes, offset, length, hash, output, targetOffset);
             if (cached >= 0) {
-                // 同一请求、同一密钥下，相同明文的密文完全一致，命中后直接复制 HEX。
                 return cached;
             }
             int hexLength = cipher.encryptToHex(bytes, offset, length, temp, 0);
-            System.arraycopy(temp, 0, output, 0, hexLength);
-            // 只在同一请求内缓存；不同请求 sm4Key 可能不同，不能跨请求复用密文。
+            System.arraycopy(temp, 0, output, targetOffset, hexLength);
             cache.put(bytes, offset, length, hash, temp, 0, hexLength);
             return hexLength;
         }
@@ -252,6 +275,20 @@ public class EncryptService {
                 return;
             }
             restTemplate.postForObject(callbackUrl, new CallbackRequest(properties.getTeamCode(), requestId, ip), String.class);
+        }
+
+        private void submitCallback() {
+            String callbackUrl = properties.getCallbackUrl();
+            if (callbackUrl == null || callbackUrl.isEmpty()) {
+                return;
+            }
+            callbackExecutor.execute(() -> {
+                try {
+                    callback();
+                } catch (RuntimeException e) {
+                    log.warn("callback failed, requestId={}", requestId, e);
+                }
+            });
         }
     }
 }
