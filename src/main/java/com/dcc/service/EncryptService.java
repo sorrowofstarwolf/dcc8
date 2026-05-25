@@ -19,10 +19,12 @@ import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PreDestroy;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -35,6 +37,7 @@ public class EncryptService {
     private final RestTemplate restTemplate;
     private final ThreadPoolExecutor executor;
     private final ThreadPoolExecutor callbackExecutor;
+    private final Semaphore writePermits;
 
     public EncryptService(AppProperties properties, DataStore dataStore, Sm4Cipher sm4Cipher) {
         this.properties = properties;
@@ -44,6 +47,7 @@ public class EncryptService {
         requestFactory.setConnectTimeout(properties.getRequestTimeoutMillis());
         requestFactory.setReadTimeout(properties.getRequestTimeoutMillis());
         this.restTemplate = new RestTemplate(requestFactory);
+        this.writePermits = new Semaphore(Math.max(1, properties.getWritePermits()));
         this.executor = new ThreadPoolExecutor(
                 properties.getWorkerThreads(),
                 properties.getWorkerThreads(),
@@ -142,8 +146,19 @@ public class EncryptService {
             Sm4Cipher.Context cipher = sm4Cipher.newContext(sm4Key);
             RequestEncryptedDictionary[] encryptedDictionaries = buildEncryptedDictionaries(data, cipher);
             FixedCipherCache[] caches = new FixedCipherCache[FieldId.FIELD_COUNT];
+            int outputLength = estimateOutputLength(data, encryptedDictionaries);
+            if (outputLength <= properties.getMaxBufferedOutputBytes()) {
+                writeBuffered(data, output, cipher, encryptedDictionaries, caches, outputLength);
+            } else {
+                writeStreaming(data, output, cipher, encryptedDictionaries, caches);
+            }
+        }
+
+        private void writeBuffered(LoadedData data, Path output, Sm4Cipher.Context cipher,
+                                   RequestEncryptedDictionary[] encryptedDictionaries, FixedCipherCache[] caches,
+                                   int outputLength) throws IOException {
             byte[] tempBuffer = new byte[256];
-            byte[] outputBytes = new byte[estimateOutputLength(data, encryptedDictionaries)];
+            byte[] outputBytes = new byte[outputLength];
             int position = 0;
             for (int row = 0; row < data.rows(); row++) {
                 for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
@@ -173,7 +188,48 @@ public class EncryptService {
                 }
                 outputBytes[position++] = '\n';
             }
-            Files.write(output, outputBytes);
+            try (OutputStream out = throttledOutputStream(output)) {
+                out.write(outputBytes);
+            }
+        }
+
+        private void writeStreaming(LoadedData data, Path output, Sm4Cipher.Context cipher,
+                                    RequestEncryptedDictionary[] encryptedDictionaries, FixedCipherCache[] caches)
+                throws IOException {
+            byte[] cellBuffer = new byte[256];
+            byte[] tempBuffer = new byte[256];
+            try (OutputStream out = throttledOutputStream(output)) {
+                FastCsvWriter writer = new FastCsvWriter(out, properties.getOutputBufferBytes());
+                for (int row = 0; row < data.rows(); row++) {
+                    for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
+                        if (fieldIndex > 0) {
+                            writer.writeByte(',');
+                        }
+                        int fieldId = fields[fieldIndex];
+                        ColumnData column = data.column(fieldId);
+                        byte[] bytes = column.bytes();
+                        int offset = column.offset(row);
+                        int length = column.length(row);
+                        if (FieldId.isMaskField(fieldId)) {
+                            writer.writeBytes(bytes, offset, length);
+                        } else if (encryptedDictionaries[fieldId] != null) {
+                            RequestEncryptedDictionary encryptedDictionary = encryptedDictionaries[fieldId];
+                            DictionaryColumnData dictionary = data.dictionary(fieldId);
+                            int valueId = dictionary.rowValueId(row);
+                            writer.writeBytes(encryptedDictionary.bytes, encryptedDictionary.offsets[valueId], encryptedDictionary.lengths[valueId]);
+                        } else {
+                            int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer, 0, tempBuffer);
+                            writer.writeBytes(cellBuffer, 0, hexLength);
+                        }
+                    }
+                    writer.writeByte('\n');
+                }
+                writer.flush();
+            }
+        }
+
+        private OutputStream throttledOutputStream(Path output) throws IOException {
+            return new WritePermitOutputStream(Files.newOutputStream(output), writePermits);
         }
 
         private int estimateOutputLength(LoadedData data, RequestEncryptedDictionary[] encryptedDictionaries) {
@@ -289,6 +345,60 @@ public class EncryptService {
                     log.warn("callback failed, requestId={}", requestId, e);
                 }
             });
+        }
+    }
+
+    private static final class WritePermitOutputStream extends OutputStream {
+        private final OutputStream delegate;
+        private final Semaphore permits;
+
+        private WritePermitOutputStream(OutputStream delegate, Semaphore permits) {
+            this.delegate = delegate;
+            this.permits = permits;
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            acquire();
+            try {
+                delegate.write(b);
+            } finally {
+                permits.release();
+            }
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            acquire();
+            try {
+                delegate.write(b, off, len);
+            } finally {
+                permits.release();
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            acquire();
+            try {
+                delegate.flush();
+            } finally {
+                permits.release();
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+
+        private void acquire() throws IOException {
+            try {
+                permits.acquire();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for write permit", e);
+            }
         }
     }
 }

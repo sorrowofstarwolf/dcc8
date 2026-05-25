@@ -10,12 +10,14 @@ public class AppProperties {
     private String callbackUrl = "";
     private int workerThreads = 3;
     private int queueCapacity = 128;
+    private int writePermits = 1;
     private int callbackThreads = 4;
     private int callbackQueueCapacity = 128;
     private int expectedRows = 300000;
     private int initialRawPoolBytes = 64 * 1024 * 1024;
     private int initialMaskPoolBytes = 16 * 1024 * 1024;
     private int outputBufferBytes = 1024 * 1024;
+    private int maxBufferedOutputBytes = 32 * 1024 * 1024;
     private int cacheCapacity = 524288;
     private boolean dictionaryEnabled = true;
     private int requestTimeoutMillis = 120000;
@@ -33,6 +35,8 @@ public class AppProperties {
     public void setWorkerThreads(int workerThreads) { this.workerThreads = workerThreads; }
     public int getQueueCapacity() { return queueCapacity; }
     public void setQueueCapacity(int queueCapacity) { this.queueCapacity = queueCapacity; }
+    public int getWritePermits() { return writePermits; }
+    public void setWritePermits(int writePermits) { this.writePermits = writePermits; }
     public int getCallbackThreads() { return callbackThreads; }
     public void setCallbackThreads(int callbackThreads) { this.callbackThreads = callbackThreads; }
     public int getCallbackQueueCapacity() { return callbackQueueCapacity; }
@@ -45,6 +49,8 @@ public class AppProperties {
     public void setInitialMaskPoolBytes(int initialMaskPoolBytes) { this.initialMaskPoolBytes = initialMaskPoolBytes; }
     public int getOutputBufferBytes() { return outputBufferBytes; }
     public void setOutputBufferBytes(int outputBufferBytes) { this.outputBufferBytes = outputBufferBytes; }
+    public int getMaxBufferedOutputBytes() { return maxBufferedOutputBytes; }
+    public void setMaxBufferedOutputBytes(int maxBufferedOutputBytes) { this.maxBufferedOutputBytes = maxBufferedOutputBytes; }
     public int getCacheCapacity() { return cacheCapacity; }
     public void setCacheCapacity(int cacheCapacity) { this.cacheCapacity = cacheCapacity; }
     public boolean isDictionaryEnabled() { return dictionaryEnabled; }

@@ -228,12 +228,47 @@ public class Sm4Cipher {
 
         private void encryptBlock(int x0, int x1, int x2, int x3, byte[] output, int offset) {
             int[] rk = roundKeys;
-            for (int i = 0; i < 32; i += 4) {
-                x0 ^= transform(x1 ^ x2 ^ x3 ^ rk[i]);
-                x1 ^= transform(x2 ^ x3 ^ x0 ^ rk[i + 1]);
-                x2 ^= transform(x3 ^ x0 ^ x1 ^ rk[i + 2]);
-                x3 ^= transform(x0 ^ x1 ^ x2 ^ rk[i + 3]);
-            }
+            int rk0 = rk[0], rk1 = rk[1], rk2 = rk[2], rk3 = rk[3];
+            int rk4 = rk[4], rk5 = rk[5], rk6 = rk[6], rk7 = rk[7];
+            int rk8 = rk[8], rk9 = rk[9], rk10 = rk[10], rk11 = rk[11];
+            int rk12 = rk[12], rk13 = rk[13], rk14 = rk[14], rk15 = rk[15];
+            int rk16 = rk[16], rk17 = rk[17], rk18 = rk[18], rk19 = rk[19];
+            int rk20 = rk[20], rk21 = rk[21], rk22 = rk[22], rk23 = rk[23];
+            int rk24 = rk[24], rk25 = rk[25], rk26 = rk[26], rk27 = rk[27];
+            int rk28 = rk[28], rk29 = rk[29], rk30 = rk[30], rk31 = rk[31];
+
+            x0 ^= transform(x1 ^ x2 ^ x3 ^ rk0);
+            x1 ^= transform(x2 ^ x3 ^ x0 ^ rk1);
+            x2 ^= transform(x3 ^ x0 ^ x1 ^ rk2);
+            x3 ^= transform(x0 ^ x1 ^ x2 ^ rk3);
+            x0 ^= transform(x1 ^ x2 ^ x3 ^ rk4);
+            x1 ^= transform(x2 ^ x3 ^ x0 ^ rk5);
+            x2 ^= transform(x3 ^ x0 ^ x1 ^ rk6);
+            x3 ^= transform(x0 ^ x1 ^ x2 ^ rk7);
+            x0 ^= transform(x1 ^ x2 ^ x3 ^ rk8);
+            x1 ^= transform(x2 ^ x3 ^ x0 ^ rk9);
+            x2 ^= transform(x3 ^ x0 ^ x1 ^ rk10);
+            x3 ^= transform(x0 ^ x1 ^ x2 ^ rk11);
+            x0 ^= transform(x1 ^ x2 ^ x3 ^ rk12);
+            x1 ^= transform(x2 ^ x3 ^ x0 ^ rk13);
+            x2 ^= transform(x3 ^ x0 ^ x1 ^ rk14);
+            x3 ^= transform(x0 ^ x1 ^ x2 ^ rk15);
+            x0 ^= transform(x1 ^ x2 ^ x3 ^ rk16);
+            x1 ^= transform(x2 ^ x3 ^ x0 ^ rk17);
+            x2 ^= transform(x3 ^ x0 ^ x1 ^ rk18);
+            x3 ^= transform(x0 ^ x1 ^ x2 ^ rk19);
+            x0 ^= transform(x1 ^ x2 ^ x3 ^ rk20);
+            x1 ^= transform(x2 ^ x3 ^ x0 ^ rk21);
+            x2 ^= transform(x3 ^ x0 ^ x1 ^ rk22);
+            x3 ^= transform(x0 ^ x1 ^ x2 ^ rk23);
+            x0 ^= transform(x1 ^ x2 ^ x3 ^ rk24);
+            x1 ^= transform(x2 ^ x3 ^ x0 ^ rk25);
+            x2 ^= transform(x3 ^ x0 ^ x1 ^ rk26);
+            x3 ^= transform(x0 ^ x1 ^ x2 ^ rk27);
+            x0 ^= transform(x1 ^ x2 ^ x3 ^ rk28);
+            x1 ^= transform(x2 ^ x3 ^ x0 ^ rk29);
+            x2 ^= transform(x3 ^ x0 ^ x1 ^ rk30);
+            x3 ^= transform(x0 ^ x1 ^ x2 ^ rk31);
             writeInt(x3, output, offset);
             writeInt(x2, output, offset + 4);
             writeInt(x1, output, offset + 8);
