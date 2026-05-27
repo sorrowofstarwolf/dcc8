@@ -6,7 +6,8 @@ dcc:
   dataset-path: table_data_baseline.csv
   output-dir: output
   callback-url: ""
-  worker-threads: 3
+  worker-threads: 4
+  active-heavy-jobs: 0
   queue-capacity: 128
   write-permits: 1
   callback-threads: 4
@@ -18,5 +19,11 @@ dcc:
   max-buffered-output-bytes: 33554432
   cache-capacity: 524288
   dictionary-enabled: true
+  chunked-pipeline-enabled: false
+  chunk-worker-threads: 32
+  chunk-queue-capacity: 512
+  chunk-rows: 10000
+  chunk-max-in-flight-per-request: 0
+  chunk-buffer-pool-bytes: 268435456
   request-timeout-millis: 120000
   baseline-validation-enabled: false

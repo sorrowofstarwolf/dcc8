@@ -17,37 +17,64 @@ import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
+import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 public class EncryptService {
     private static final Logger log = LoggerFactory.getLogger(EncryptService.class);
+    private static final int MIN_ENCRYPTED_HEX_LENGTH = 32;
+    private static final int MAX_DICTIONARY_UNIQUE_PERCENT = 50;
+    private static final int HIGH_CARDINALITY_DICTIONARY_ROWS = 100_000;
     private final AppProperties properties;
     private final DataStore dataStore;
     private final Sm4Cipher sm4Cipher;
     private final RestTemplate restTemplate;
     private final ThreadPoolExecutor executor;
+    private final ThreadPoolExecutor chunkExecutor;
+    private final BlockingQueue<EncryptTask> jobQueue;
+    private final Semaphore activeHeavyJobSlots;
     private final ThreadPoolExecutor callbackExecutor;
     private final Semaphore writePermits;
+    private final ThreadLocal<Sm4Cipher.Context> chunkCipherContext;
+    private final ChunkBufferPool chunkBufferPool;
+    private final AtomicBoolean running = new AtomicBoolean(true);
+    private Thread dispatcherThread;
 
     public EncryptService(AppProperties properties, DataStore dataStore, Sm4Cipher sm4Cipher) {
         this.properties = properties;
         this.dataStore = dataStore;
         this.sm4Cipher = sm4Cipher;
+        this.chunkCipherContext = ThreadLocal.withInitial(() -> this.sm4Cipher.newContext("0000000000000000"));
+        this.chunkBufferPool = new ChunkBufferPool(properties.getChunkBufferPoolBytes());
         SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
         requestFactory.setConnectTimeout(properties.getRequestTimeoutMillis());
         requestFactory.setReadTimeout(properties.getRequestTimeoutMillis());
         this.restTemplate = new RestTemplate(requestFactory);
         this.writePermits = new Semaphore(Math.max(1, properties.getWritePermits()));
+        this.jobQueue = new ArrayBlockingQueue<>(properties.getQueueCapacity());
+        int activeHeavyJobs = properties.getActiveHeavyJobs() > 0
+                ? properties.getActiveHeavyJobs()
+                : properties.getWorkerThreads();
+        this.activeHeavyJobSlots = new Semaphore(Math.max(1, activeHeavyJobs), true);
         this.executor = new ThreadPoolExecutor(
                 properties.getWorkerThreads(),
                 properties.getWorkerThreads(),
@@ -56,6 +83,18 @@ public class EncryptService {
                 new ArrayBlockingQueue<>(properties.getQueueCapacity()),
                 runnable -> {
                     Thread thread = new Thread(runnable, "dcc-encrypt-worker");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                new ThreadPoolExecutor.AbortPolicy());
+        this.chunkExecutor = new ThreadPoolExecutor(
+                Math.max(1, properties.getChunkWorkerThreads()),
+                Math.max(1, properties.getChunkWorkerThreads()),
+                0L,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(properties.getChunkQueueCapacity()),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "dcc-chunk-worker");
                     thread.setDaemon(true);
                     return thread;
                 },
@@ -74,6 +113,13 @@ public class EncryptService {
                 new ThreadPoolExecutor.CallerRunsPolicy());
     }
 
+    @PostConstruct
+    public void startDispatcher() {
+        dispatcherThread = new Thread(this::dispatchLoop, "dcc-job-dispatcher");
+        dispatcherThread.setDaemon(true);
+        dispatcherThread.start();
+    }
+
     public void submit(EncryptRequest request) {
         int[] fields = new int[FieldId.MAX_REQUEST_FIELDS];
         String[] names = request.getFieldsToEncrypt();
@@ -83,7 +129,10 @@ public class EncryptService {
         for (int i = 0; i < names.length; i++) {
             fields[i] = FieldId.fromName(names[i]);
         }
-        executor.execute(new EncryptTask(request.getRequestId(), request.getSm4Key(), request.getIp(), fields, names.length));
+        boolean accepted = jobQueue.offer(new EncryptTask(request.getRequestId(), request.getSm4Key(), request.getIp(), fields, names.length));
+        if (!accepted) {
+            throw new RejectedExecutionException("encrypt job queue is full");
+        }
     }
 
     public Path generateBlocking(EncryptRequest request) {
@@ -100,8 +149,45 @@ public class EncryptService {
 
     @PreDestroy
     public void shutdown() {
+        running.set(false);
+        if (dispatcherThread != null) {
+            dispatcherThread.interrupt();
+        }
         executor.shutdown();
+        chunkExecutor.shutdown();
         callbackExecutor.shutdown();
+    }
+
+    private void dispatchLoop() {
+        while (running.get()) {
+            boolean permitAcquired = false;
+            try {
+                EncryptTask task = jobQueue.take();
+                activeHeavyJobSlots.acquire();
+                permitAcquired = true;
+                executor.execute(() -> {
+                    try {
+                        task.run();
+                    } finally {
+                        activeHeavyJobSlots.release();
+                    }
+                });
+                permitAcquired = false;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (RejectedExecutionException e) {
+                if (permitAcquired) {
+                    activeHeavyJobSlots.release();
+                }
+                log.warn("encrypt executor rejected dispatched job", e);
+            } catch (RuntimeException e) {
+                if (permitAcquired) {
+                    activeHeavyJobSlots.release();
+                }
+                log.warn("encrypt dispatcher failed", e);
+            }
+        }
     }
 
     private final class EncryptTask implements Runnable {
@@ -146,16 +232,25 @@ public class EncryptService {
             Sm4Cipher.Context cipher = sm4Cipher.newContext(sm4Key);
             RequestEncryptedDictionary[] encryptedDictionaries = buildEncryptedDictionaries(data, cipher);
             FixedCipherCache[] caches = new FixedCipherCache[FieldId.FIELD_COUNT];
-            int outputLength = estimateOutputLength(data, encryptedDictionaries);
-            if (outputLength <= properties.getMaxBufferedOutputBytes()) {
-                writeBuffered(data, output, cipher, encryptedDictionaries, caches, outputLength);
+            boolean[] cellCacheEnabled = buildCellCachePlan(data, encryptedDictionaries);
+            if (properties.isChunkedPipelineEnabled() && isDefinitelyStreamingOutput(data)) {
+                writeChunked(data, output, encryptedDictionaries, cellCacheEnabled);
+                return;
+            }
+            int outputLength = -1;
+            if (!isDefinitelyStreamingOutput(data)) {
+                outputLength = estimateOutputLength(data, encryptedDictionaries);
+            }
+            if (outputLength >= 0 && outputLength <= properties.getMaxBufferedOutputBytes()) {
+                writeBuffered(data, output, cipher, encryptedDictionaries, caches, cellCacheEnabled, outputLength);
             } else {
-                writeStreaming(data, output, cipher, encryptedDictionaries, caches);
+                writeStreaming(data, output, cipher, encryptedDictionaries, caches, cellCacheEnabled);
             }
         }
 
         private void writeBuffered(LoadedData data, Path output, Sm4Cipher.Context cipher,
                                    RequestEncryptedDictionary[] encryptedDictionaries, FixedCipherCache[] caches,
+                                   boolean[] cellCacheEnabled,
                                    int outputLength) throws IOException {
             byte[] tempBuffer = new byte[256];
             byte[] outputBytes = new byte[outputLength];
@@ -182,7 +277,7 @@ public class EncryptService {
                         System.arraycopy(encryptedDictionary.bytes, encryptedOffset, outputBytes, position, encryptedLength);
                         position += encryptedLength;
                     } else {
-                        int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, outputBytes, position, tempBuffer);
+                        int hexLength = encryptCell(fieldId, cipher, caches, cellCacheEnabled, bytes, offset, length, outputBytes, position, tempBuffer);
                         position += hexLength;
                     }
                 }
@@ -194,37 +289,198 @@ public class EncryptService {
         }
 
         private void writeStreaming(LoadedData data, Path output, Sm4Cipher.Context cipher,
-                                    RequestEncryptedDictionary[] encryptedDictionaries, FixedCipherCache[] caches)
+                                    RequestEncryptedDictionary[] encryptedDictionaries, FixedCipherCache[] caches,
+                                    boolean[] cellCacheEnabled)
                 throws IOException {
-            byte[] cellBuffer = new byte[256];
-            byte[] tempBuffer = new byte[256];
             try (OutputStream out = throttledOutputStream(output)) {
                 FastCsvWriter writer = new FastCsvWriter(out, properties.getOutputBufferBytes());
-                for (int row = 0; row < data.rows(); row++) {
-                    for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
-                        if (fieldIndex > 0) {
-                            writer.writeByte(',');
-                        }
-                        int fieldId = fields[fieldIndex];
-                        ColumnData column = data.column(fieldId);
-                        byte[] bytes = column.bytes();
-                        int offset = column.offset(row);
-                        int length = column.length(row);
-                        if (FieldId.isMaskField(fieldId)) {
-                            writer.writeBytes(bytes, offset, length);
-                        } else if (encryptedDictionaries[fieldId] != null) {
-                            RequestEncryptedDictionary encryptedDictionary = encryptedDictionaries[fieldId];
-                            DictionaryColumnData dictionary = data.dictionary(fieldId);
-                            int valueId = dictionary.rowValueId(row);
-                            writer.writeBytes(encryptedDictionary.bytes, encryptedDictionary.offsets[valueId], encryptedDictionary.lengths[valueId]);
-                        } else {
-                            int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer, 0, tempBuffer);
-                            writer.writeBytes(cellBuffer, 0, hexLength);
-                        }
-                    }
-                    writer.writeByte('\n');
-                }
+                writeRows(data, 0, data.rows(), cipher, encryptedDictionaries, caches, cellCacheEnabled, writer);
                 writer.flush();
+            }
+        }
+
+        private void writeChunked(LoadedData data, Path output,
+                                  RequestEncryptedDictionary[] encryptedDictionaries,
+                                  boolean[] cellCacheEnabled) throws IOException {
+            int chunkRows = Math.max(1, properties.getChunkRows());
+            int totalChunks = Math.max(1, (data.rows() + chunkRows - 1) / chunkRows);
+            ExecutorCompletionService<ChunkTaskResult> completionService =
+                    new ExecutorCompletionService<>(chunkExecutor);
+            int maxInFlight = properties.getChunkMaxInFlightPerRequest() > 0
+                    ? properties.getChunkMaxInFlightPerRequest()
+                    : totalChunks;
+            maxInFlight = Math.max(1, Math.min(totalChunks, maxInFlight));
+            List<ChunkBytes> orderedChunks = new ArrayList<>(totalChunks);
+            for (int i = 0; i < totalChunks; i++) {
+                orderedChunks.add(null);
+            }
+            int nextChunkToSubmit = 0;
+            int submitted = 0;
+            while (submitted < maxInFlight) {
+                submitChunk(completionService, data, chunkRows, nextChunkToSubmit,
+                        encryptedDictionaries, cellCacheEnabled);
+                nextChunkToSubmit++;
+                submitted++;
+            }
+            int nextChunkToWrite = 0;
+            try (OutputStream out = throttledOutputStream(output)) {
+                for (int completed = 0; completed < totalChunks; completed++) {
+                    ChunkTaskResult result = takeChunkResult(completionService);
+                    orderedChunks.set(result.chunkIndex, result.chunkBytes);
+                    if (nextChunkToSubmit < totalChunks) {
+                        submitChunk(completionService, data, chunkRows, nextChunkToSubmit,
+                                encryptedDictionaries, cellCacheEnabled);
+                        nextChunkToSubmit++;
+                    }
+                    while (nextChunkToWrite < totalChunks) {
+                        ChunkBytes chunk = orderedChunks.get(nextChunkToWrite);
+                        if (chunk == null) {
+                            break;
+                        }
+                        orderedChunks.set(nextChunkToWrite, null);
+                        out.write(chunk.bytes, 0, chunk.length);
+                        chunkBufferPool.release(chunk.bytes);
+                        nextChunkToWrite++;
+                    }
+                }
+            }
+        }
+
+        private void submitChunk(ExecutorCompletionService<ChunkTaskResult> completionService,
+                                 LoadedData data, int chunkRows, int chunkIndex,
+                                 RequestEncryptedDictionary[] encryptedDictionaries,
+                                 boolean[] cellCacheEnabled) {
+            int startRow = chunkIndex * chunkRows;
+            int endRow = Math.min(data.rows(), startRow + chunkRows);
+            completionService.submit(new RenderChunkTask(
+                    data,
+                    chunkIndex,
+                    startRow,
+                    endRow,
+                    encryptedDictionaries,
+                    cellCacheEnabled));
+        }
+
+        private ChunkTaskResult takeChunkResult(ExecutorCompletionService<ChunkTaskResult> completionService)
+                throws IOException {
+            try {
+                Future<ChunkTaskResult> completed = completionService.take();
+                return completed.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for chunk", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                throw new IOException("Failed to render chunk", cause);
+            }
+        }
+
+        private final class RenderChunkTask implements Callable<ChunkTaskResult> {
+            private final LoadedData data;
+            private final int chunkIndex;
+            private final int startRow;
+            private final int endRow;
+            private final RequestEncryptedDictionary[] encryptedDictionaries;
+            private final boolean[] cellCacheEnabled;
+
+            private RenderChunkTask(LoadedData data, int chunkIndex, int startRow, int endRow,
+                                    RequestEncryptedDictionary[] encryptedDictionaries,
+                                    boolean[] cellCacheEnabled) {
+                this.data = data;
+                this.chunkIndex = chunkIndex;
+                this.startRow = startRow;
+                this.endRow = endRow;
+                this.encryptedDictionaries = encryptedDictionaries;
+                this.cellCacheEnabled = cellCacheEnabled;
+            }
+
+            @Override
+            public ChunkTaskResult call() throws IOException {
+                Sm4Cipher.Context chunkCipher = chunkCipherContext.get().reset(sm4Key);
+                FixedCipherCache[] chunkCaches = new FixedCipherCache[FieldId.FIELD_COUNT];
+                int capacity = estimateChunkCapacity(data, startRow, endRow, encryptedDictionaries);
+                ChunkCsvWriter writer = new ChunkCsvWriter(chunkBufferPool.borrow(capacity));
+                writeRows(data, startRow, endRow, chunkCipher, encryptedDictionaries, chunkCaches, cellCacheEnabled, writer);
+                return new ChunkTaskResult(chunkIndex, new ChunkBytes(writer.buffer(), writer.length()));
+            }
+        }
+
+        private int estimateChunkCapacity(LoadedData data, int startRow, int endRow,
+                                          RequestEncryptedDictionary[] encryptedDictionaries) {
+            long total = (long) (endRow - startRow) * fieldCount;
+            for (int row = startRow; row < endRow; row++) {
+                for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
+                    int fieldId = fields[fieldIndex];
+                    ColumnData column = data.column(fieldId);
+                    if (FieldId.isMaskField(fieldId)) {
+                        total += column.length(row);
+                    } else if (encryptedDictionaries[fieldId] != null) {
+                        RequestEncryptedDictionary encryptedDictionary = encryptedDictionaries[fieldId];
+                        DictionaryColumnData dictionary = data.dictionary(fieldId);
+                        int valueId = dictionary.rowValueId(row);
+                        total += encryptedDictionary.lengths[valueId];
+                    } else {
+                        total += encryptedHexLength(column.length(row));
+                    }
+                }
+            }
+            if (total > Integer.MAX_VALUE - 1024L) {
+                throw new IllegalStateException("Chunk output is too large to buffer: " + total);
+            }
+            return Math.max(8192, (int) total + 1024);
+        }
+
+        private final class ChunkTaskResult {
+            private final int chunkIndex;
+            private final ChunkBytes chunkBytes;
+
+            private ChunkTaskResult(int chunkIndex, ChunkBytes chunkBytes) {
+                this.chunkIndex = chunkIndex;
+                this.chunkBytes = chunkBytes;
+            }
+        }
+
+        private final class ChunkBytes {
+            private final byte[] bytes;
+            private final int length;
+
+            private ChunkBytes(byte[] bytes, int length) {
+                this.bytes = bytes;
+                this.length = length;
+            }
+        }
+
+        private void writeRows(LoadedData data, int startRow, int endRow, Sm4Cipher.Context cipher,
+                               RequestEncryptedDictionary[] encryptedDictionaries, FixedCipherCache[] caches,
+                               boolean[] cellCacheEnabled, CsvByteWriter writer) throws IOException {
+            byte[] cellBuffer = new byte[256];
+            byte[] tempBuffer = new byte[256];
+            for (int row = startRow; row < endRow; row++) {
+                for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
+                    if (fieldIndex > 0) {
+                        writer.writeByte(',');
+                    }
+                    int fieldId = fields[fieldIndex];
+                    ColumnData column = data.column(fieldId);
+                    byte[] bytes = column.bytes();
+                    int offset = column.offset(row);
+                    int length = column.length(row);
+                    if (FieldId.isMaskField(fieldId)) {
+                        writer.writeBytes(bytes, offset, length);
+                    } else if (encryptedDictionaries[fieldId] != null) {
+                        RequestEncryptedDictionary encryptedDictionary = encryptedDictionaries[fieldId];
+                        DictionaryColumnData dictionary = data.dictionary(fieldId);
+                        int valueId = dictionary.rowValueId(row);
+                        writer.writeBytes(encryptedDictionary.bytes, encryptedDictionary.offsets[valueId], encryptedDictionary.lengths[valueId]);
+                    } else {
+                        int hexLength = encryptCell(fieldId, cipher, caches, cellCacheEnabled, bytes, offset, length, cellBuffer, 0, tempBuffer);
+                        writer.writeBytes(cellBuffer, 0, hexLength);
+                    }
+                }
+                writer.writeByte('\n');
             }
         }
 
@@ -261,11 +517,45 @@ public class EncryptService {
             RequestEncryptedDictionary[] encrypted = new RequestEncryptedDictionary[FieldId.FIELD_COUNT];
             for (int i = 0; i < fieldCount; i++) {
                 int fieldId = fields[i];
-                if (data.hasDictionary(fieldId)) {
+                if (shouldUseRequestDictionary(data, fieldId)) {
                     encrypted[fieldId] = encryptDictionary(data.dictionary(fieldId), cipher);
                 }
             }
             return encrypted;
+        }
+
+        private boolean shouldUseRequestDictionary(LoadedData data, int fieldId) {
+            if (!data.hasDictionary(fieldId)) {
+                return false;
+            }
+            DictionaryColumnData dictionary = data.dictionary(fieldId);
+            if (dictionary.uniqueCount() >= HIGH_CARDINALITY_DICTIONARY_ROWS
+                    && (long) dictionary.uniqueCount() * 100L > (long) data.rows() * MAX_DICTIONARY_UNIQUE_PERCENT) {
+                return false;
+            }
+            return true;
+        }
+
+        private boolean isDefinitelyStreamingOutput(LoadedData data) {
+            long lowerBound = (long) data.rows() * fieldCount;
+            for (int i = 0; i < fieldCount; i++) {
+                int fieldId = fields[i];
+                if (!FieldId.isMaskField(fieldId)) {
+                    lowerBound += (long) data.rows() * MIN_ENCRYPTED_HEX_LENGTH;
+                }
+            }
+            return lowerBound > properties.getMaxBufferedOutputBytes();
+        }
+
+        private boolean[] buildCellCachePlan(LoadedData data, RequestEncryptedDictionary[] encryptedDictionaries) {
+            boolean[] enabled = new boolean[FieldId.FIELD_COUNT];
+            for (int i = 0; i < fieldCount; i++) {
+                int fieldId = fields[i];
+                enabled[fieldId] = FieldId.shouldCache(fieldId)
+                        && encryptedDictionaries[fieldId] == null
+                        && shouldUseRequestDictionary(data, fieldId);
+            }
+            return enabled;
         }
 
         private RequestEncryptedDictionary encryptDictionary(DictionaryColumnData dictionary, Sm4Cipher.Context cipher) {
@@ -304,8 +594,8 @@ public class EncryptService {
             }
         }
 
-        private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches, byte[] bytes, int offset, int length, byte[] output, int targetOffset, byte[] temp) {
-            if (!FieldId.shouldCache(fieldId)) {
+        private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches, boolean[] cellCacheEnabled, byte[] bytes, int offset, int length, byte[] output, int targetOffset, byte[] temp) {
+            if (!cellCacheEnabled[fieldId]) {
                 return cipher.encryptToHex(bytes, offset, length, output, targetOffset);
             }
             FixedCipherCache cache = caches[fieldId];

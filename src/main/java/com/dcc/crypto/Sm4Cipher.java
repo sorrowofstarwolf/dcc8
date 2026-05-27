@@ -79,13 +79,21 @@ public class Sm4Cipher {
     }
 
     public Context newContext(String key) {
-        return new Context(key.getBytes(StandardCharsets.UTF_8));
+        return new Context().reset(key);
     }
 
     public static final class Context {
         private final int[] roundKeys = new int[32];
 
-        private Context(byte[] key) {
+        private Context() {
+        }
+
+        public Context reset(String key) {
+            reset(key.getBytes(StandardCharsets.UTF_8));
+            return this;
+        }
+
+        private void reset(byte[] key) {
             if (key.length != 16) {
                 throw new IllegalArgumentException("SM4 key must be 16 bytes");
             }
@@ -112,26 +120,24 @@ public class Sm4Cipher {
         }
 
         private int encryptLength4(byte[] source, int offset, byte[] target, int targetOffset) {
-            encryptBlock(
+            encryptBlockToHex(
                     word(source, offset) ^ IV0,
                     0x393A3B34,
                     0x353C3D3E,
                     0x3F38393A,
                     target, targetOffset);
-            toHexInPlace(target, targetOffset, 16);
             return 32;
         }
 
         private int encryptLength5(byte[] source, int offset, byte[] target, int targetOffset) {
             int x1 = (((source[offset + 4] & 0xFF) ^ (IV[4] & 0xFF)) << 24)
                     | 0x3D3C33;
-            encryptBlock(
+            encryptBlockToHex(
                     word(source, offset) ^ IV0,
                     x1,
                     0x323B3A39,
                     0x383F3E3D,
                     target, targetOffset);
-            toHexInPlace(target, targetOffset, 16);
             return 32;
         }
 
@@ -139,25 +145,23 @@ public class Sm4Cipher {
             int x1 = (((source[offset + 4] & 0xFF) ^ (IV[4] & 0xFF)) << 24)
                     | (((source[offset + 5] & 0xFF) ^ (IV[5] & 0xFF)) << 16)
                     | 0x3D32;
-            encryptBlock(
+            encryptBlockToHex(
                     word(source, offset) ^ IV0,
                     x1,
                     0x333A3B38,
                     0x393E3F3C,
                     target, targetOffset);
-            toHexInPlace(target, targetOffset, 16);
             return 32;
         }
 
         private int encryptOneBlock(byte[] source, int offset, int length, byte[] target, int targetOffset) {
             int padding = 16 - length;
-            encryptBlock(
+            encryptBlockToHex(
                     wordWithIv(source, offset, length, padding, 0),
                     wordWithIv(source, offset, length, padding, 4),
                     wordWithIv(source, offset, length, padding, 8),
                     wordWithIv(source, offset, length, padding, 12),
                     target, targetOffset);
-            toHexInPlace(target, targetOffset, 16);
             return 32;
         }
 
@@ -227,6 +231,14 @@ public class Sm4Cipher {
         }
 
         private void encryptBlock(int x0, int x1, int x2, int x3, byte[] output, int offset) {
+            encryptBlock0(x0, x1, x2, x3, output, offset, false);
+        }
+
+        private void encryptBlockToHex(int x0, int x1, int x2, int x3, byte[] output, int offset) {
+            encryptBlock0(x0, x1, x2, x3, output, offset, true);
+        }
+
+        private void encryptBlock0(int x0, int x1, int x2, int x3, byte[] output, int offset, boolean hexOutput) {
             int[] rk = roundKeys;
             int rk0 = rk[0], rk1 = rk[1], rk2 = rk[2], rk3 = rk[3];
             int rk4 = rk[4], rk5 = rk[5], rk6 = rk[6], rk7 = rk[7];
@@ -269,10 +281,17 @@ public class Sm4Cipher {
             x1 ^= transform(x2 ^ x3 ^ x0 ^ rk29);
             x2 ^= transform(x3 ^ x0 ^ x1 ^ rk30);
             x3 ^= transform(x0 ^ x1 ^ x2 ^ rk31);
-            writeInt(x3, output, offset);
-            writeInt(x2, output, offset + 4);
-            writeInt(x1, output, offset + 8);
-            writeInt(x0, output, offset + 12);
+            if (hexOutput) {
+                writeHexInt(x3, output, offset);
+                writeHexInt(x2, output, offset + 8);
+                writeHexInt(x1, output, offset + 16);
+                writeHexInt(x0, output, offset + 24);
+            } else {
+                writeInt(x3, output, offset);
+                writeInt(x2, output, offset + 4);
+                writeInt(x1, output, offset + 8);
+                writeInt(x0, output, offset + 12);
+            }
         }
 
         private static void expandKey(byte[] key, int[] roundKeys) {
@@ -323,6 +342,19 @@ public class Sm4Cipher {
             output[offset + 1] = (byte) (value >>> 16);
             output[offset + 2] = (byte) (value >>> 8);
             output[offset + 3] = (byte) value;
+        }
+
+        private static void writeHexInt(int value, byte[] output, int offset) {
+            writeHexByte(value >>> 24, output, offset);
+            writeHexByte(value >>> 16, output, offset + 2);
+            writeHexByte(value >>> 8, output, offset + 4);
+            writeHexByte(value, output, offset + 6);
+        }
+
+        private static void writeHexByte(int value, byte[] output, int offset) {
+            int b = value & 0xFF;
+            output[offset] = HEX[b >>> 4];
+            output[offset + 1] = HEX[b & 0x0F];
         }
 
         private static int transform(int value) {

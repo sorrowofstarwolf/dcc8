@@ -3,7 +3,7 @@ package com.dcc.service;
 import java.io.IOException;
 import java.io.OutputStream;
 
-final class FastCsvWriter {
+final class FastCsvWriter implements CsvByteWriter {
     private final OutputStream out;
     private final byte[] buffer;
     private int position;
@@ -13,14 +13,16 @@ final class FastCsvWriter {
         this.buffer = new byte[Math.max(8192, bufferBytes)];
     }
 
-    void writeByte(int value) throws IOException {
+    @Override
+    public void writeByte(int value) throws IOException {
         if (position == buffer.length) {
             flushBuffer();
         }
         buffer[position++] = (byte) value;
     }
 
-    void writeBytes(byte[] bytes, int offset, int length) throws IOException {
+    @Override
+    public void writeBytes(byte[] bytes, int offset, int length) throws IOException {
         if (length >= buffer.length) {
             flushBuffer();
             out.write(bytes, offset, length);
@@ -33,7 +35,8 @@ final class FastCsvWriter {
         position += length;
     }
 
-    void flush() throws IOException {
+    @Override
+    public void flush() throws IOException {
         flushBuffer();
         out.flush();
     }

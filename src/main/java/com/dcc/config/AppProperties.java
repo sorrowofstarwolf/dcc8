@@ -8,7 +8,8 @@ public class AppProperties {
     private String datasetPath = "table_data.csv";
     private String outputDir = "/opt/app/dcc/team16/output";
     private String callbackUrl = "";
-    private int workerThreads = 3;
+    private int workerThreads = 4;
+    private int activeHeavyJobs = 0;
     private int queueCapacity = 128;
     private int writePermits = 1;
     private int callbackThreads = 4;
@@ -20,6 +21,12 @@ public class AppProperties {
     private int maxBufferedOutputBytes = 32 * 1024 * 1024;
     private int cacheCapacity = 524288;
     private boolean dictionaryEnabled = true;
+    private boolean chunkedPipelineEnabled = false;
+    private int chunkWorkerThreads = 32;
+    private int chunkQueueCapacity = 512;
+    private int chunkRows = 10000;
+    private int chunkMaxInFlightPerRequest = 0;
+    private int chunkBufferPoolBytes = 256 * 1024 * 1024;
     private int requestTimeoutMillis = 120000;
     private boolean baselineValidationEnabled = false;
 
@@ -33,6 +40,8 @@ public class AppProperties {
     public void setCallbackUrl(String callbackUrl) { this.callbackUrl = callbackUrl; }
     public int getWorkerThreads() { return workerThreads; }
     public void setWorkerThreads(int workerThreads) { this.workerThreads = workerThreads; }
+    public int getActiveHeavyJobs() { return activeHeavyJobs; }
+    public void setActiveHeavyJobs(int activeHeavyJobs) { this.activeHeavyJobs = activeHeavyJobs; }
     public int getQueueCapacity() { return queueCapacity; }
     public void setQueueCapacity(int queueCapacity) { this.queueCapacity = queueCapacity; }
     public int getWritePermits() { return writePermits; }
@@ -55,6 +64,18 @@ public class AppProperties {
     public void setCacheCapacity(int cacheCapacity) { this.cacheCapacity = cacheCapacity; }
     public boolean isDictionaryEnabled() { return dictionaryEnabled; }
     public void setDictionaryEnabled(boolean dictionaryEnabled) { this.dictionaryEnabled = dictionaryEnabled; }
+    public boolean isChunkedPipelineEnabled() { return chunkedPipelineEnabled; }
+    public void setChunkedPipelineEnabled(boolean chunkedPipelineEnabled) { this.chunkedPipelineEnabled = chunkedPipelineEnabled; }
+    public int getChunkWorkerThreads() { return chunkWorkerThreads; }
+    public void setChunkWorkerThreads(int chunkWorkerThreads) { this.chunkWorkerThreads = chunkWorkerThreads; }
+    public int getChunkQueueCapacity() { return chunkQueueCapacity; }
+    public void setChunkQueueCapacity(int chunkQueueCapacity) { this.chunkQueueCapacity = chunkQueueCapacity; }
+    public int getChunkRows() { return chunkRows; }
+    public void setChunkRows(int chunkRows) { this.chunkRows = chunkRows; }
+    public int getChunkMaxInFlightPerRequest() { return chunkMaxInFlightPerRequest; }
+    public void setChunkMaxInFlightPerRequest(int chunkMaxInFlightPerRequest) { this.chunkMaxInFlightPerRequest = chunkMaxInFlightPerRequest; }
+    public int getChunkBufferPoolBytes() { return chunkBufferPoolBytes; }
+    public void setChunkBufferPoolBytes(int chunkBufferPoolBytes) { this.chunkBufferPoolBytes = chunkBufferPoolBytes; }
     public int getRequestTimeoutMillis() { return requestTimeoutMillis; }
     public void setRequestTimeoutMillis(int requestTimeoutMillis) { this.requestTimeoutMillis = requestTimeoutMillis; }
     public boolean isBaselineValidationEnabled() { return baselineValidationEnabled; }
