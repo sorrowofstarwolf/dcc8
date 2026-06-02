@@ -17,12 +17,14 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PreDestroy;
-import java.io.BufferedOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
-import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -135,12 +137,9 @@ public class EncryptService {
             FixedCipherCache[] caches = new FixedCipherCache[FieldId.FIELD_COUNT];
             // cellBuffer/tempBuffer 是请求级复用缓冲，避免每个单元格创建密文数组或 HEX 字符串。
             byte[] cellBuffer = new byte[256];
-            byte[] tempBuffer = new byte[256];
-            try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(output), properties.getOutputBufferBytes())) {
+            try (ChannelCsvWriter out = new ChannelCsvWriter(output, properties.getOutputBufferBytes())) {
                 for (int row = 0; row < data.rows(); row++) {
                     if (row > 0) {
-                        // baseline 使用 CRLF 且文件末尾不额外追加空行。
-                        out.write('\r');
                         out.write('\n');
                     }
                     for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
@@ -157,7 +156,7 @@ public class EncryptService {
                             out.write(bytes, offset, length);
                         } else {
                             // SM4 字段按当前请求密钥即时加密，密文直接写入输出流。
-                            int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer, tempBuffer);
+                            int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer);
                             out.write(cellBuffer, 0, hexLength);
                         }
                     }
@@ -167,7 +166,7 @@ public class EncryptService {
             }
         }
 
-        private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches, byte[] bytes, int offset, int length, byte[] output, byte[] temp) {
+        private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches, byte[] bytes, int offset, int length, byte[] output) {
             if (!FieldId.shouldCache(fieldId)) {
                 // 高基数字段重复率低，直接加密通常比查缓存更划算。
                 return cipher.encryptToHex(bytes, offset, length, output, 0);
@@ -185,10 +184,9 @@ public class EncryptService {
                 // 同一请求、同一密钥下，相同明文的密文完全一致，命中后直接复制 HEX。
                 return cached;
             }
-            int hexLength = cipher.encryptToHex(bytes, offset, length, temp, 0);
-            System.arraycopy(temp, 0, output, 0, hexLength);
+            int hexLength = cipher.encryptToHex(bytes, offset, length, output, 0);
             // 只在同一请求内缓存；不同请求 sm4Key 可能不同，不能跨请求复用密文。
-            cache.put(bytes, offset, length, hash, temp, 0, hexLength);
+            cache.put(bytes, offset, length, hash, output, 0, hexLength);
             return hexLength;
         }
 
@@ -198,6 +196,55 @@ public class EncryptService {
                 return;
             }
             restTemplate.postForObject(callbackUrl, new CallbackRequest(properties.getTeamCode(), requestId, ip), String.class);
+        }
+    }
+
+    private static final class ChannelCsvWriter implements Closeable {
+        private final FileChannel channel;
+        private final ByteBuffer buffer;
+
+        private ChannelCsvWriter(Path output, int bufferBytes) throws IOException {
+            this.channel = FileChannel.open(
+                    output,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE);
+            this.buffer = ByteBuffer.allocate(bufferBytes);
+        }
+
+        private void write(int value) throws IOException {
+            if (!buffer.hasRemaining()) {
+                flush();
+            }
+            buffer.put((byte) value);
+        }
+
+        private void write(byte[] bytes, int offset, int length) throws IOException {
+            int position = offset;
+            int remaining = length;
+            while (remaining > 0) {
+                if (!buffer.hasRemaining()) {
+                    flush();
+                }
+                int chunk = Math.min(buffer.remaining(), remaining);
+                buffer.put(bytes, position, chunk);
+                position += chunk;
+                remaining -= chunk;
+            }
+        }
+
+        private void flush() throws IOException {
+            buffer.flip();
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
+            buffer.clear();
+        }
+
+        @Override
+        public void close() throws IOException {
+            flush();
+            channel.close();
         }
     }
 }

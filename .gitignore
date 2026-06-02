@@ -7,6 +7,10 @@ perf_data_*.csv
 contest-output-*/
 contest-lowcache-output-*/
 perf-output-*/
+perf-output/
+local-perf-output/
+perf-reports/
+local-perf-reports/
 loadtime-output-*/
 loadtime-*.log
 output/

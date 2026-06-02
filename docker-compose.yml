@@ -1,0 +1,31 @@
+services:
+  dcc-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dcc:local
+    container_name: dcc-app
+    ports:
+      - "8080:8080"
+    cpus: 4
+    mem_limit: 8g
+    environment:
+      SERVER_PORT: 8080
+      DCC_TEAM_CODE: team16
+      DCC_DATASET_PATH: /opt/app/dcc/table_data_baseline.csv
+      DCC_OUTPUT_DIR: /opt/app/dcc/output
+      DCC_CALLBACK_URL: ""
+      DCC_WORKER_THREADS: 3
+      DCC_QUEUE_CAPACITY: 128
+      DCC_EXPECTED_ROWS: 300000
+      DCC_INITIAL_RAW_POOL_BYTES: 67108864
+      DCC_INITIAL_MASK_POOL_BYTES: 16777216
+      DCC_OUTPUT_BUFFER_BYTES: 1048576
+      DCC_CACHE_CAPACITY: 524288
+      DCC_REQUEST_TIMEOUT_MILLIS: 120000
+      DCC_BASELINE_VALIDATION_ENABLED: "false"
+    volumes:
+      - ./output:/opt/app/dcc/output
+      - ./perf-reports:/opt/app/dcc/perf-reports
+      - ./table_data_baseline.csv:/opt/app/dcc/table_data_baseline.csv:ro
+      - ./perf_data_extreme_unique_300000.csv:/opt/app/dcc/perf_data_extreme_unique_300000.csv:ro

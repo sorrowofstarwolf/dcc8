@@ -59,8 +59,8 @@ class BaselineValidationTest {
     private void assertBaselineExceptPhoneColumn(byte[] actualBytes, byte[] expectedBytes) {
         String actual = new String(actualBytes, StandardCharsets.UTF_8);
         String expected = new String(expectedBytes, StandardCharsets.UTF_8);
-        String[] actualRows = actual.split("\\r\\n");
-        String[] expectedRows = expected.split("\\r\\n");
+        String[] actualRows = actual.split("\\R");
+        String[] expectedRows = expected.split("\\R");
         assertThat(actualRows).hasSameSizeAs(expectedRows);
         for (int i = 0; i < expectedRows.length; i++) {
             String actualTail = actualRows[i].substring(actualRows[i].indexOf(','));

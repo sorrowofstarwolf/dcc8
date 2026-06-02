@@ -1,14 +1,17 @@
 package com.dcc.crypto;
 
+import org.bouncycastle.crypto.BufferedBlockCipher;
+import org.bouncycastle.crypto.InvalidCipherTextException;
+import org.bouncycastle.crypto.engines.SM4Engine;
+import org.bouncycastle.crypto.modes.CBCBlockCipher;
+import org.bouncycastle.crypto.paddings.PaddedBufferedBlockCipher;
+import org.bouncycastle.crypto.params.KeyParameter;
+import org.bouncycastle.crypto.params.ParametersWithIV;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.springframework.stereotype.Component;
 
-import javax.crypto.Cipher;
-import javax.crypto.spec.IvParameterSpec;
-import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
-import java.security.GeneralSecurityException;
 import java.security.Security;
-import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 @Component
 public class Sm4Cipher {
@@ -16,50 +19,43 @@ public class Sm4Cipher {
     private static final byte[] HEX = "0123456789ABCDEF".getBytes(StandardCharsets.US_ASCII);
 
     static {
-        // BouncyCastle 提供 SM4/CBC/PKCS5Padding；静态注册保证测试和应用启动路径都能找到 Provider。
         if (Security.getProvider("BC") == null) {
             Security.addProvider(new BouncyCastleProvider());
         }
     }
 
     public Context newContext(String key) {
-        try {
-            return new Context(key.getBytes(StandardCharsets.UTF_8));
-        } catch (GeneralSecurityException e) {
-            throw new IllegalArgumentException("Invalid SM4 key", e);
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+        if (keyBytes.length != 16) {
+            throw new IllegalArgumentException("SM4 key must be 16 bytes");
         }
+        return new Context(keyBytes);
     }
 
     public static final class Context {
-        private final Cipher cipher;
-        private final SecretKeySpec keySpec;
-        private final IvParameterSpec ivSpec;
+        private final BufferedBlockCipher cipher;
+        private final ParametersWithIV parameters;
+        private final byte[] encryptedBuffer;
 
-        private Context(byte[] key) throws GeneralSecurityException {
-            if (key.length != 16) {
-                throw new IllegalArgumentException("SM4 key must be 16 bytes");
-            }
-            // 严格按题目要求：SM4-CBC、固定 IV、PKCS5/PKCS7 padding。
-            // Context 按请求创建一次，同一请求内反复复用 Cipher、KeySpec 和 IvSpec，减少对象创建。
-            this.cipher = Cipher.getInstance("SM4/CBC/PKCS5Padding", "BC");
-            this.keySpec = new SecretKeySpec(key, "SM4");
-            this.ivSpec = new IvParameterSpec(IV);
+        private Context(byte[] key) {
+            this.cipher = new PaddedBufferedBlockCipher(new CBCBlockCipher(new SM4Engine()));
+            this.parameters = new ParametersWithIV(new KeyParameter(key), IV);
+            this.encryptedBuffer = new byte[256];
         }
 
         public int encryptToHex(byte[] source, int offset, int length, byte[] target, int targetOffset) {
             try {
-                // 每个单元格都从固定 IV 开始加密，符合“字段独立加密”的 baseline 行为。
-                cipher.init(Cipher.ENCRYPT_MODE, keySpec, ivSpec);
-                int encrypted = cipher.doFinal(source, offset, length, target, targetOffset);
-                int hexEnd = targetOffset + encrypted * 2;
-                // 直接在目标 byte[] 中原地倒序转大写 HEX，避免生成中间 String 或额外密文字节数组。
-                for (int src = targetOffset + encrypted - 1, dst = hexEnd - 2; src >= targetOffset; src--, dst -= 2) {
-                    int value = target[src] & 0xFF;
+                cipher.init(true, parameters);
+                int encrypted = cipher.processBytes(source, offset, length, encryptedBuffer, 0);
+                encrypted += cipher.doFinal(encryptedBuffer, encrypted);
+                int dst = targetOffset + encrypted * 2 - 2;
+                for (int src = encrypted - 1; src >= 0; src--, dst -= 2) {
+                    int value = encryptedBuffer[src] & 0xFF;
                     target[dst] = HEX[value >>> 4];
                     target[dst + 1] = HEX[value & 0x0F];
                 }
                 return encrypted * 2;
-            } catch (GeneralSecurityException e) {
+            } catch (InvalidCipherTextException e) {
                 throw new IllegalStateException("SM4 encryption failed", e);
             }
         }

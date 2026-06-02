@@ -1,0 +1,8 @@
+target
+!target/dcc-1.0-SNAPSHOT.jar
+.git
+.idea
+*.iml
+contest-output-*
+perf-output-*
+diag-one-run.log
