@@ -11,6 +11,7 @@ param(
     [string]$AppJarHostPath = ".\\target\\dcc-1.0-SNAPSHOT.jar",
     [string]$FieldsJson = '["user_id","serial_no","user_code","business_key","device_id","trans_id","secret_code","name"]',
     [int]$PollIntervalSeconds = 1,
+    [int]$WorkerThreads = 3,
     [int]$OutputBufferBytes = 94371840,
     [int]$AsyncWriteQueueSlots = 20,
     [int]$AsyncWriteWorkerThreads = 8,
@@ -32,7 +33,6 @@ function Assert-LastExitCode {
 }
 
 $datasetPath = (Resolve-Path $DatasetHostPath).Path
-$appJarPath = (Resolve-Path $AppJarHostPath).Path
 $runId = Get-Date -Format "yyyyMMddHHmmss"
 $outputDirRoot = Join-Path $root $OutputDirHost.TrimStart(".\")
 $outputDir = Join-Path $outputDirRoot ("run-" + $runId)
@@ -63,6 +63,10 @@ if (-not $SkipImageBuild) {
     docker build --pull=false -t $ImageName .
     Assert-LastExitCode "docker build"
 }
+if (-not (Test-Path $AppJarHostPath)) {
+    throw "application jar not found at $AppJarHostPath"
+}
+$appJarPath = (Resolve-Path $AppJarHostPath).Path
 $existingContainer = docker ps -aq -f "name=^${AppContainer}$"
 if ($existingContainer) {
     docker rm -f $AppContainer | Out-Null
@@ -86,6 +90,7 @@ docker run -d `
   -e DCC_OUTPUT_DIR=/opt/app/dcc/output `
   -e DCC_EXPECTED_ROWS=300000 `
   -e DCC_CALLBACK_URL= `
+  -e DCC_WORKER_THREADS=$WorkerThreads `
   -e DCC_OUTPUT_BUFFER_BYTES=$OutputBufferBytes `
   -e DCC_ASYNC_WRITE_QUEUE_SLOTS=$AsyncWriteQueueSlots `
   -e DCC_ASYNC_WRITE_WORKER_THREADS=$AsyncWriteWorkerThreads `
@@ -188,6 +193,7 @@ $summaryFile = Join-Path $reportDir "$jfrName.run.txt"
     "requestsPerSecond=$requestsPerSecond"
     "throughputMBps=$throughputMBps"
     "pollIntervalSeconds=$PollIntervalSeconds"
+    "workerThreads=$WorkerThreads"
     "outputBufferBytes=$OutputBufferBytes"
     "asyncWriteQueueSlots=$AsyncWriteQueueSlots"
     "asyncWriteWorkerThreads=$AsyncWriteWorkerThreads"

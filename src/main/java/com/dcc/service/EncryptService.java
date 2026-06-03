@@ -14,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PreDestroy;
@@ -33,6 +34,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class EncryptService {
@@ -100,15 +103,19 @@ public class EncryptService {
         asyncWriter.close();
     }
 
-    private void callback(String callbackRequestId, String callbackIp) {
+    private void callback(String callbackRequestId, String callbackIp) throws IOException {
         String callbackUrl = properties.getCallbackUrl();
         if (callbackUrl == null || callbackUrl.isEmpty()) {
             return;
         }
-        restTemplate.postForObject(
-                callbackUrl,
-                new CallbackRequest(properties.getTeamCode(), callbackRequestId, callbackIp),
-                String.class);
+        try {
+            restTemplate.postForObject(
+                    callbackUrl,
+                    new CallbackRequest(properties.getTeamCode(), callbackRequestId, callbackIp),
+                    String.class);
+        } catch (RestClientException e) {
+            throw new IOException("Failed to callback " + callbackUrl + " for request " + callbackRequestId, e);
+        }
     }
 
     private final class EncryptTask implements Runnable {
@@ -152,9 +159,19 @@ public class EncryptService {
             FixedCipherCache[] caches = new FixedCipherCache[FieldId.FIELD_COUNT];
             byte[] cellBuffer = new byte[256];
             byte[] rowBuffer = new byte[2048];
-            BufferChunk chunk = asyncWriter.takeChunk();
+            RequestState state = asyncWriter.createState(
+                    requestId,
+                    sm4Key == null ? 0 : sm4Key.length(),
+                    fieldCount,
+                    data.rows(),
+                    ip,
+                    output,
+                    startNanos,
+                    doCallback);
+            BufferChunk chunk = takeChunk(state);
             ByteBuffer buffer = chunk.buffer;
             buffer.clear();
+            boolean append = false;
             try {
                 for (int row = 0; row < data.rows(); row++) {
                     int rowLength = 0;
@@ -184,27 +201,34 @@ public class EncryptService {
 
                     rowBuffer = ensureCapacity(rowBuffer, rowLength + 1);
                     rowBuffer[rowLength++] = (byte) '\n';
-                    if (buffer.remaining() < rowLength) {
-                        throw new IOException("Output exceeded direct buffer capacity for request " + requestId
+                    if (rowLength > buffer.capacity()) {
+                        throw new IOException("Output row exceeded direct buffer capacity for request " + requestId
                                 + ", required more than " + properties.getOutputBufferBytes() + " bytes");
+                    }
+                    if (buffer.remaining() < rowLength) {
+                        asyncWriter.submit(state, chunk, append, false);
+                        append = true;
+                        chunk = takeChunk(state);
+                        buffer = chunk.buffer;
+                        buffer.clear();
                     }
                     buffer.put(rowBuffer, 0, rowLength);
                 }
-                return asyncWriter.submit(new CompletedRequest(
-                        requestId,
-                        sm4Key == null ? 0 : sm4Key.length(),
-                        fieldCount,
-                        data.rows(),
-                        ip,
-                        output,
-                        chunk,
-                        startNanos,
-                        doCallback));
+                return asyncWriter.submit(state, chunk, append, true);
             } catch (IOException e) {
                 chunk.buffer.clear();
                 asyncWriter.recycle(chunk);
+                state.completion.completeExceptionally(e);
                 throw e;
             }
+        }
+
+        private BufferChunk takeChunk(RequestState state) throws IOException {
+            long waitStart = System.nanoTime();
+            BufferChunk chunk = asyncWriter.takeChunk();
+            state.takeChunkCount.incrementAndGet();
+            state.takeChunkWaitNanos.addAndGet(System.nanoTime() - waitStart);
+            return chunk;
         }
 
         private Path awaitCompletion(CompletableFuture<Path> completion) throws IOException {
@@ -262,27 +286,24 @@ public class EncryptService {
     }
 
     private final class GlobalAsyncWriter implements Closeable {
-        private final CompletedRequest poison = new CompletedRequest(null, 0, 0, 0, null, null, null, 0L, false);
+        private final WriteTask poison = new WriteTask(null, null, false, false);
 
         private final BlockingQueue<BufferChunk> available;
-        private final BlockingQueue<CompletedRequest> pending;
-        private final List<Thread> writerThreads;
+        private final List<WriterWorker> workers;
         private volatile IOException failure;
 
         private GlobalAsyncWriter(int bufferBytes, int queueSlots, int writerCount) {
             int slots = Math.max(2, queueSlots);
             int writers = Math.max(1, writerCount);
             this.available = new ArrayBlockingQueue<>(slots);
-            this.pending = new ArrayBlockingQueue<>(slots);
             for (int i = 0; i < slots; i++) {
                 available.add(new BufferChunk(ByteBuffer.allocateDirect(bufferBytes)));
             }
-            this.writerThreads = new ArrayList<>(writers);
+            this.workers = new ArrayList<>(writers);
             for (int i = 0; i < writers; i++) {
-                Thread writerThread = new Thread(this::runWriterLoop, "dcc-file-writer-" + i);
-                writerThread.setDaemon(true);
-                writerThread.start();
-                writerThreads.add(writerThread);
+                WriterWorker worker = new WriterWorker(this, i, slots);
+                worker.thread.start();
+                workers.add(worker);
             }
         }
 
@@ -304,26 +325,32 @@ public class EncryptService {
             available.offer(chunk);
         }
 
-        private CompletableFuture<Path> submit(CompletedRequest request) throws IOException {
+        private RequestState createState(String requestId, int keyLength, int fieldCount, int rows,
+                                         String ip, Path output, long startNanos, boolean doCallback) {
+            int writerIndex = Math.floorMod(requestId.hashCode(), workers.size());
+            return new RequestState(requestId, keyLength, fieldCount, rows, ip, output, startNanos, doCallback, writerIndex);
+        }
+
+        private CompletableFuture<Path> submit(RequestState state, BufferChunk chunk, boolean append, boolean lastChunk) throws IOException {
             ensureHealthy();
             try {
-                pending.put(request);
-                return request.completion;
+                workers.get(state.writerIndex).pending.put(new WriteTask(state, chunk, append, lastChunk));
+                return state.completion;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                recycle(request.chunk);
-                throw new IOException("Interrupted while queueing a completed request", e);
+                recycle(chunk);
+                throw new IOException("Interrupted while queueing a write chunk", e);
             }
         }
 
-        private void runWriterLoop() {
+        private void runWriterLoop(WriterWorker worker) {
             try {
                 while (true) {
-                    CompletedRequest request = pending.take();
-                    if (request == poison) {
+                    WriteTask task = worker.pending.take();
+                    if (task == poison) {
                         return;
                     }
-                    writeRequest(request);
+                    writeTask(task);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -331,42 +358,63 @@ public class EncryptService {
             } catch (IOException e) {
                 failure = e;
             } finally {
-                failPending();
+                failPending(worker);
             }
         }
 
-        private void writeRequest(CompletedRequest request) throws IOException {
-            ByteBuffer buffer = request.chunk.buffer;
+        private void writeTask(WriteTask task) throws IOException {
+            ByteBuffer buffer = task.chunk.buffer;
             try {
+                long openStartNanos = System.nanoTime();
+                task.state.chunkCount.incrementAndGet();
                 try (FileChannel channel = FileChannel.open(
-                        request.output,
+                        task.state.output,
                         StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING,
-                        StandardOpenOption.WRITE)) {
+                        StandardOpenOption.WRITE,
+                        task.append ? StandardOpenOption.APPEND : StandardOpenOption.TRUNCATE_EXISTING)) {
+                    task.state.openNanos.addAndGet(System.nanoTime() - openStartNanos);
                     buffer.flip();
+                    long writeStartNanos = System.nanoTime();
                     while (buffer.hasRemaining()) {
                         channel.write(buffer);
                     }
+                    task.state.writeNanos.addAndGet(System.nanoTime() - writeStartNanos);
                 }
-                long millis = (System.nanoTime() - request.startNanos) / 1_000_000L;
-                log.info("requestId={}, fields={}, keyLength={}, rows={}, millis={}",
-                        request.requestId, request.fieldCount, request.keyLength, request.rows, millis);
-                if (request.doCallback) {
-                    callback(request.requestId, request.ip);
+                if (task.lastChunk) {
+                    long millis = (System.nanoTime() - task.state.startNanos) / 1_000_000L;
+                    log.info("requestId={}, fields={}, keyLength={}, rows={}, millis={}, chunks={}, takeChunkCount={}, takeChunkWaitMillis={}, writerOpenMillis={}, writerWriteMillis={}",
+                            task.state.requestId,
+                            task.state.fieldCount,
+                            task.state.keyLength,
+                            task.state.rows,
+                            millis,
+                            task.state.chunkCount.get(),
+                            task.state.takeChunkCount.get(),
+                            TimeUnit.NANOSECONDS.toMillis(task.state.takeChunkWaitNanos.get()),
+                            TimeUnit.NANOSECONDS.toMillis(task.state.openNanos.get()),
+                            TimeUnit.NANOSECONDS.toMillis(task.state.writeNanos.get()));
+                    if (task.state.doCallback) {
+                        callback(task.state.requestId, task.state.ip);
+                    }
+                    task.state.completion.complete(task.state.output);
                 }
-                request.completion.complete(request.output);
+            } catch (IOException e) {
+                task.state.completion.completeExceptionally(e);
+                throw e;
             } finally {
-                recycle(request.chunk);
+                recycle(task.chunk);
             }
         }
 
-        private void failPending() {
-            CompletedRequest request;
-            while ((request = pending.poll()) != null) {
-                if (request.chunk != null) {
-                    recycle(request.chunk);
+        private void failPending(WriterWorker worker) {
+            WriteTask task;
+            while ((task = worker.pending.poll()) != null) {
+                if (task.chunk != null) {
+                    recycle(task.chunk);
                 }
-                request.completion.completeExceptionally(failure != null ? failure : new IOException("Writer stopped"));
+                if (task.state != null) {
+                    task.state.completion.completeExceptionally(failure != null ? failure : new IOException("Writer stopped"));
+                }
             }
         }
 
@@ -380,11 +428,11 @@ public class EncryptService {
         public void close() {
             IOException closeFailure = null;
             try {
-                for (int i = 0; i < writerThreads.size(); i++) {
-                    pending.put(poison);
+                for (WriterWorker worker : workers) {
+                    worker.pending.put(poison);
                 }
-                for (Thread writerThread : writerThreads) {
-                    writerThread.join();
+                for (WriterWorker worker : workers) {
+                    worker.thread.join();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -407,30 +455,62 @@ public class EncryptService {
         }
     }
 
-    private static final class CompletedRequest {
+    private final class WriterWorker {
+        private final BlockingQueue<WriteTask> pending;
+        private final Thread thread;
+        private final GlobalAsyncWriter owner;
+
+        private WriterWorker(GlobalAsyncWriter owner, int index, int queueSlots) {
+            this.owner = owner;
+            this.pending = new ArrayBlockingQueue<>(queueSlots);
+            this.thread = new Thread(() -> owner.runWriterLoop(this), "dcc-file-writer-" + index);
+            this.thread.setDaemon(true);
+        }
+    }
+
+    private static final class RequestState {
         private final String requestId;
         private final int keyLength;
         private final int fieldCount;
         private final int rows;
         private final String ip;
         private final Path output;
-        private final BufferChunk chunk;
         private final long startNanos;
         private final boolean doCallback;
+        private final int writerIndex;
         private final CompletableFuture<Path> completion = new CompletableFuture<>();
+        private final AtomicInteger chunkCount = new AtomicInteger();
+        private final AtomicInteger takeChunkCount = new AtomicInteger();
+        private final AtomicLong takeChunkWaitNanos = new AtomicLong();
+        private final AtomicLong openNanos = new AtomicLong();
+        private final AtomicLong writeNanos = new AtomicLong();
 
-        private CompletedRequest(String requestId, int keyLength, int fieldCount, int rows,
-                                 String ip, Path output, BufferChunk chunk, long startNanos,
-                                 boolean doCallback) {
+        private RequestState(String requestId, int keyLength, int fieldCount, int rows,
+                             String ip, Path output, long startNanos,
+                             boolean doCallback, int writerIndex) {
             this.requestId = requestId;
             this.keyLength = keyLength;
             this.fieldCount = fieldCount;
             this.rows = rows;
             this.ip = ip;
             this.output = output;
-            this.chunk = chunk;
             this.startNanos = startNanos;
             this.doCallback = doCallback;
+            this.writerIndex = writerIndex;
+        }
+    }
+
+    private static final class WriteTask {
+        private final RequestState state;
+        private final BufferChunk chunk;
+        private final boolean append;
+        private final boolean lastChunk;
+
+        private WriteTask(RequestState state, BufferChunk chunk, boolean append, boolean lastChunk) {
+            this.state = state;
+            this.chunk = chunk;
+            this.append = append;
+            this.lastChunk = lastChunk;
         }
     }
 }

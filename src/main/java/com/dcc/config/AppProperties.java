@@ -13,7 +13,7 @@ public class AppProperties {
     private int expectedRows = 300000;
     private int initialRawPoolBytes = 64 * 1024 * 1024;
     private int initialMaskPoolBytes = 16 * 1024 * 1024;
-    private int outputBufferBytes = 90 * 1024 * 1024;
+    private int outputBufferBytes = 48 * 1024 * 1024;
     private int asyncWriteQueueSlots = 20;
     private int asyncWriteWorkerThreads = 8;
     private int cacheCapacity = 524288;
