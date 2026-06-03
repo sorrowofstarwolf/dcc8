@@ -25,29 +25,36 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 @Service
 public class EncryptService {
     private static final Logger log = LoggerFactory.getLogger(EncryptService.class);
+
     private final AppProperties properties;
     private final DataStore dataStore;
     private final Sm4Cipher sm4Cipher;
     private final RestTemplate restTemplate;
     private final ThreadPoolExecutor executor;
+    private final GlobalAsyncWriter asyncWriter;
 
     public EncryptService(AppProperties properties, DataStore dataStore, Sm4Cipher sm4Cipher) {
         this.properties = properties;
         this.dataStore = dataStore;
         this.sm4Cipher = sm4Cipher;
+
         SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
         requestFactory.setConnectTimeout(properties.getRequestTimeoutMillis());
         requestFactory.setReadTimeout(properties.getRequestTimeoutMillis());
         this.restTemplate = new RestTemplate(requestFactory);
-        // 固定小线程池用于削峰：HTTP 可以同时进来 100 个请求，但真正执行加密的线程保持在配置值。
-        // 这样可以减少线程切换、GC 压力和磁盘写入争抢，通常比 100 个任务同时跑更快。
+
         this.executor = new ThreadPoolExecutor(
                 properties.getWorkerThreads(),
                 properties.getWorkerThreads(),
@@ -60,10 +67,13 @@ public class EncryptService {
                     return thread;
                 },
                 new ThreadPoolExecutor.CallerRunsPolicy());
+        this.asyncWriter = new GlobalAsyncWriter(
+                properties.getOutputBufferBytes(),
+                properties.getAsyncWriteQueueSlots(),
+                properties.getAsyncWriteWorkerThreads());
     }
 
     public void submit(EncryptRequest request) {
-        // 请求字段最多 7 个，直接使用固定长度 int[] 保存字段编号，避免热路径 List/Map 分配。
         int[] fields = new int[FieldId.MAX_REQUEST_FIELDS];
         String[] names = request.getFieldsToEncrypt();
         if (names == null || names.length == 0 || names.length > FieldId.MAX_REQUEST_FIELDS) {
@@ -72,7 +82,6 @@ public class EncryptService {
         for (int i = 0; i < names.length; i++) {
             fields[i] = FieldId.fromName(names[i]);
         }
-        // 任务对象是每个请求允许创建的少量对象之一；真正的大量行处理在任务内部复用缓冲区。
         executor.execute(new EncryptTask(request.getRequestId(), request.getSm4Key(), request.getIp(), fields, names.length));
     }
 
@@ -88,6 +97,18 @@ public class EncryptService {
     @PreDestroy
     public void shutdown() {
         executor.shutdown();
+        asyncWriter.close();
+    }
+
+    private void callback(String callbackRequestId, String callbackIp) {
+        String callbackUrl = properties.getCallbackUrl();
+        if (callbackUrl == null || callbackUrl.isEmpty()) {
+            return;
+        }
+        restTemplate.postForObject(
+                callbackUrl,
+                new CallbackRequest(properties.getTeamCode(), callbackRequestId, callbackIp),
+                String.class);
     }
 
     private final class EncryptTask implements Runnable {
@@ -112,139 +133,304 @@ public class EncryptService {
 
         private Path call(boolean doCallback) {
             long start = System.nanoTime();
-            // 首次请求会在这里触发 DataStore 惰性加载；后续请求拿到同一个 LoadedData。
             LoadedData data = dataStore.get();
             Path output = Paths.get(properties.getOutputDir(), requestId + ".csv");
             try {
                 Files.createDirectories(output.getParent());
-                writeFile(data, output);
+                CompletableFuture<Path> completion = writeFile(data, output, start, doCallback);
                 if (doCallback) {
-                    // 文件写完并关闭后再回调，避免验证程序读到半写入文件。
-                    callback();
+                    return output;
                 }
-                long millis = (System.nanoTime() - start) / 1_000_000L;
-                log.info("requestId={}, fields={}, keyLength={}, rows={}, millis={}", requestId, fieldCount, sm4Key == null ? 0 : sm4Key.length(), data.rows(), millis);
-                return output;
+                return awaitCompletion(completion);
             } catch (IOException e) {
                 throw new IllegalStateException("Failed to write output file for " + requestId, e);
             }
         }
 
-        private void writeFile(LoadedData data, Path output) throws IOException {
-            // 每个请求一个 SM4 Context，因为 sm4Key 随请求变化；同一请求内复用该 Context。
+        private CompletableFuture<Path> writeFile(LoadedData data, Path output, long startNanos, boolean doCallback) throws IOException {
             Sm4Cipher.Context cipher = sm4Cipher.newContext(sm4Key);
-            // caches 按字段懒创建，仅低基数字段启用，避免高基数字段缓存开销超过收益。
             FixedCipherCache[] caches = new FixedCipherCache[FieldId.FIELD_COUNT];
-            // cellBuffer/tempBuffer 是请求级复用缓冲，避免每个单元格创建密文数组或 HEX 字符串。
             byte[] cellBuffer = new byte[256];
-            try (ChannelCsvWriter out = new ChannelCsvWriter(output, properties.getOutputBufferBytes())) {
+            byte[] rowBuffer = new byte[2048];
+            BufferChunk chunk = asyncWriter.takeChunk();
+            ByteBuffer buffer = chunk.buffer;
+            buffer.clear();
+            try {
                 for (int row = 0; row < data.rows(); row++) {
-                    if (row > 0) {
-                        out.write('\n');
-                    }
+                    int rowLength = 0;
                     for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
                         if (fieldIndex > 0) {
-                            out.write(',');
+                            rowBuffer = ensureCapacity(rowBuffer, rowLength + 1);
+                            rowBuffer[rowLength++] = (byte) ',';
                         }
+
                         int fieldId = fields[fieldIndex];
                         ColumnData column = data.column(fieldId);
                         byte[] bytes = column.bytes();
                         int offset = column.offset(row);
                         int length = column.length(row);
+
                         if (FieldId.isMaskField(fieldId)) {
-                            // 掩码字段已经在加载时预计算，直接从列式字节池写出。
-                            out.write(bytes, offset, length);
+                            rowBuffer = ensureCapacity(rowBuffer, rowLength + length + 1);
+                            System.arraycopy(bytes, offset, rowBuffer, rowLength, length);
+                            rowLength += length;
                         } else {
-                            // SM4 字段按当前请求密钥即时加密，密文直接写入输出流。
                             int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer);
-                            out.write(cellBuffer, 0, hexLength);
+                            rowBuffer = ensureCapacity(rowBuffer, rowLength + hexLength + 1);
+                            System.arraycopy(cellBuffer, 0, rowBuffer, rowLength, hexLength);
+                            rowLength += hexLength;
                         }
                     }
+
+                    rowBuffer = ensureCapacity(rowBuffer, rowLength + 1);
+                    rowBuffer[rowLength++] = (byte) '\n';
+                    if (buffer.remaining() < rowLength) {
+                        throw new IOException("Output exceeded direct buffer capacity for request " + requestId
+                                + ", required more than " + properties.getOutputBufferBytes() + " bytes");
+                    }
+                    buffer.put(rowBuffer, 0, rowLength);
                 }
-                // 验证程序收到回调后会立即读文件，因此必须先 flush，并依靠 try-with-resources 完成 close。
-                out.flush();
+                return asyncWriter.submit(new CompletedRequest(
+                        requestId,
+                        sm4Key == null ? 0 : sm4Key.length(),
+                        fieldCount,
+                        data.rows(),
+                        ip,
+                        output,
+                        chunk,
+                        startNanos,
+                        doCallback));
+            } catch (IOException e) {
+                chunk.buffer.clear();
+                asyncWriter.recycle(chunk);
+                throw e;
             }
         }
 
-        private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches, byte[] bytes, int offset, int length, byte[] output) {
+        private Path awaitCompletion(CompletableFuture<Path> completion) throws IOException {
+            try {
+                return completion.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for file write completion", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                throw new IOException("Failed while waiting for file write completion", cause);
+            }
+        }
+
+        private byte[] ensureCapacity(byte[] buffer, int required) {
+            if (required <= buffer.length) {
+                return buffer;
+            }
+            int next = buffer.length;
+            while (next < required) {
+                next <<= 1;
+            }
+            byte[] expanded = new byte[next];
+            System.arraycopy(buffer, 0, expanded, 0, buffer.length);
+            return expanded;
+        }
+
+        private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches,
+                                byte[] bytes, int offset, int length, byte[] output) {
             if (!FieldId.shouldCache(fieldId)) {
-                // 高基数字段重复率低，直接加密通常比查缓存更划算。
                 return cipher.encryptToHex(bytes, offset, length, output, 0);
             }
+
             FixedCipherCache cache = caches[fieldId];
             if (cache == null) {
                 int valueBytes = Math.max(1024 * 1024, properties.getCacheCapacity() * 64);
-                // 缓存容量一次性确定，不使用 HashMap，避免节点对象和运行期扩容。
                 cache = new FixedCipherCache(properties.getCacheCapacity(), valueBytes);
                 caches[fieldId] = cache;
             }
+
             int hash = Hashing.hash(bytes, offset, length);
             int cached = cache.get(bytes, offset, length, hash, output, 0);
             if (cached >= 0) {
-                // 同一请求、同一密钥下，相同明文的密文完全一致，命中后直接复制 HEX。
                 return cached;
             }
+
             int hexLength = cipher.encryptToHex(bytes, offset, length, output, 0);
-            // 只在同一请求内缓存；不同请求 sm4Key 可能不同，不能跨请求复用密文。
             cache.put(bytes, offset, length, hash, output, 0, hexLength);
             return hexLength;
         }
 
-        private void callback() {
-            String callbackUrl = properties.getCallbackUrl();
-            if (callbackUrl == null || callbackUrl.isEmpty()) {
-                return;
-            }
-            restTemplate.postForObject(callbackUrl, new CallbackRequest(properties.getTeamCode(), requestId, ip), String.class);
-        }
     }
 
-    private static final class ChannelCsvWriter implements Closeable {
-        private final FileChannel channel;
-        private final ByteBuffer buffer;
+    private final class GlobalAsyncWriter implements Closeable {
+        private final CompletedRequest poison = new CompletedRequest(null, 0, 0, 0, null, null, null, 0L, false);
 
-        private ChannelCsvWriter(Path output, int bufferBytes) throws IOException {
-            this.channel = FileChannel.open(
-                    output,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING,
-                    StandardOpenOption.WRITE);
-            this.buffer = ByteBuffer.allocate(bufferBytes);
-        }
+        private final BlockingQueue<BufferChunk> available;
+        private final BlockingQueue<CompletedRequest> pending;
+        private final List<Thread> writerThreads;
+        private volatile IOException failure;
 
-        private void write(int value) throws IOException {
-            if (!buffer.hasRemaining()) {
-                flush();
+        private GlobalAsyncWriter(int bufferBytes, int queueSlots, int writerCount) {
+            int slots = Math.max(2, queueSlots);
+            int writers = Math.max(1, writerCount);
+            this.available = new ArrayBlockingQueue<>(slots);
+            this.pending = new ArrayBlockingQueue<>(slots);
+            for (int i = 0; i < slots; i++) {
+                available.add(new BufferChunk(ByteBuffer.allocateDirect(bufferBytes)));
             }
-            buffer.put((byte) value);
+            this.writerThreads = new ArrayList<>(writers);
+            for (int i = 0; i < writers; i++) {
+                Thread writerThread = new Thread(this::runWriterLoop, "dcc-file-writer-" + i);
+                writerThread.setDaemon(true);
+                writerThread.start();
+                writerThreads.add(writerThread);
+            }
         }
 
-        private void write(byte[] bytes, int offset, int length) throws IOException {
-            int position = offset;
-            int remaining = length;
-            while (remaining > 0) {
-                if (!buffer.hasRemaining()) {
-                    flush();
+        private BufferChunk takeChunk() throws IOException {
+            ensureHealthy();
+            try {
+                return available.take();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for a direct write buffer", e);
+            }
+        }
+
+        private void recycle(BufferChunk chunk) {
+            if (chunk == null) {
+                return;
+            }
+            chunk.buffer.clear();
+            available.offer(chunk);
+        }
+
+        private CompletableFuture<Path> submit(CompletedRequest request) throws IOException {
+            ensureHealthy();
+            try {
+                pending.put(request);
+                return request.completion;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                recycle(request.chunk);
+                throw new IOException("Interrupted while queueing a completed request", e);
+            }
+        }
+
+        private void runWriterLoop() {
+            try {
+                while (true) {
+                    CompletedRequest request = pending.take();
+                    if (request == poison) {
+                        return;
+                    }
+                    writeRequest(request);
                 }
-                int chunk = Math.min(buffer.remaining(), remaining);
-                buffer.put(bytes, position, chunk);
-                position += chunk;
-                remaining -= chunk;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                failure = new IOException("Writer thread interrupted", e);
+            } catch (IOException e) {
+                failure = e;
+            } finally {
+                failPending();
             }
         }
 
-        private void flush() throws IOException {
-            buffer.flip();
-            while (buffer.hasRemaining()) {
-                channel.write(buffer);
+        private void writeRequest(CompletedRequest request) throws IOException {
+            ByteBuffer buffer = request.chunk.buffer;
+            try {
+                try (FileChannel channel = FileChannel.open(
+                        request.output,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE)) {
+                    buffer.flip();
+                    while (buffer.hasRemaining()) {
+                        channel.write(buffer);
+                    }
+                }
+                long millis = (System.nanoTime() - request.startNanos) / 1_000_000L;
+                log.info("requestId={}, fields={}, keyLength={}, rows={}, millis={}",
+                        request.requestId, request.fieldCount, request.keyLength, request.rows, millis);
+                if (request.doCallback) {
+                    callback(request.requestId, request.ip);
+                }
+                request.completion.complete(request.output);
+            } finally {
+                recycle(request.chunk);
             }
-            buffer.clear();
+        }
+
+        private void failPending() {
+            CompletedRequest request;
+            while ((request = pending.poll()) != null) {
+                if (request.chunk != null) {
+                    recycle(request.chunk);
+                }
+                request.completion.completeExceptionally(failure != null ? failure : new IOException("Writer stopped"));
+            }
+        }
+
+        private void ensureHealthy() throws IOException {
+            if (failure != null) {
+                throw failure;
+            }
         }
 
         @Override
-        public void close() throws IOException {
-            flush();
-            channel.close();
+        public void close() {
+            IOException closeFailure = null;
+            try {
+                for (int i = 0; i < writerThreads.size(); i++) {
+                    pending.put(poison);
+                }
+                for (Thread writerThread : writerThreads) {
+                    writerThread.join();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                closeFailure = new IOException("Interrupted while closing global async writer", e);
+            }
+            if (failure != null && closeFailure == null) {
+                closeFailure = failure;
+            }
+            if (closeFailure != null) {
+                throw new IllegalStateException("Failed to close async writer", closeFailure);
+            }
+        }
+    }
+
+    private static final class BufferChunk {
+        private final ByteBuffer buffer;
+
+        private BufferChunk(ByteBuffer buffer) {
+            this.buffer = buffer;
+        }
+    }
+
+    private static final class CompletedRequest {
+        private final String requestId;
+        private final int keyLength;
+        private final int fieldCount;
+        private final int rows;
+        private final String ip;
+        private final Path output;
+        private final BufferChunk chunk;
+        private final long startNanos;
+        private final boolean doCallback;
+        private final CompletableFuture<Path> completion = new CompletableFuture<>();
+
+        private CompletedRequest(String requestId, int keyLength, int fieldCount, int rows,
+                                 String ip, Path output, BufferChunk chunk, long startNanos,
+                                 boolean doCallback) {
+            this.requestId = requestId;
+            this.keyLength = keyLength;
+            this.fieldCount = fieldCount;
+            this.rows = rows;
+            this.ip = ip;
+            this.output = output;
+            this.chunk = chunk;
+            this.startNanos = startNanos;
+            this.doCallback = doCallback;
         }
     }
 }

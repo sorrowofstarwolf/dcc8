@@ -11,7 +11,9 @@ dcc:
   expected-rows: 300000
   initial-raw-pool-bytes: 67108864
   initial-mask-pool-bytes: 16777216
-  output-buffer-bytes: 1048576
+  output-buffer-bytes: 94371840
+  async-write-queue-slots: 20
+  async-write-worker-threads: 8
   cache-capacity: 524288
   request-timeout-millis: 120000
   baseline-validation-enabled: false

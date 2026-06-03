@@ -13,7 +13,9 @@ public class AppProperties {
     private int expectedRows = 300000;
     private int initialRawPoolBytes = 64 * 1024 * 1024;
     private int initialMaskPoolBytes = 16 * 1024 * 1024;
-    private int outputBufferBytes = 1024 * 1024;
+    private int outputBufferBytes = 90 * 1024 * 1024;
+    private int asyncWriteQueueSlots = 20;
+    private int asyncWriteWorkerThreads = 8;
     private int cacheCapacity = 524288;
     private int requestTimeoutMillis = 120000;
     private boolean baselineValidationEnabled = false;
@@ -38,6 +40,10 @@ public class AppProperties {
     public void setInitialMaskPoolBytes(int initialMaskPoolBytes) { this.initialMaskPoolBytes = initialMaskPoolBytes; }
     public int getOutputBufferBytes() { return outputBufferBytes; }
     public void setOutputBufferBytes(int outputBufferBytes) { this.outputBufferBytes = outputBufferBytes; }
+    public int getAsyncWriteQueueSlots() { return asyncWriteQueueSlots; }
+    public void setAsyncWriteQueueSlots(int asyncWriteQueueSlots) { this.asyncWriteQueueSlots = asyncWriteQueueSlots; }
+    public int getAsyncWriteWorkerThreads() { return asyncWriteWorkerThreads; }
+    public void setAsyncWriteWorkerThreads(int asyncWriteWorkerThreads) { this.asyncWriteWorkerThreads = asyncWriteWorkerThreads; }
     public int getCacheCapacity() { return cacheCapacity; }
     public void setCacheCapacity(int cacheCapacity) { this.cacheCapacity = cacheCapacity; }
     public int getRequestTimeoutMillis() { return requestTimeoutMillis; }
