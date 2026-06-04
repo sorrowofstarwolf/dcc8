@@ -28,12 +28,17 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -47,6 +52,7 @@ public class EncryptService {
     private final RestTemplate restTemplate;
     private final ThreadPoolExecutor executor;
     private final GlobalAsyncWriter asyncWriter;
+    private final CallbackDispatcher callbackDispatcher;
 
     public EncryptService(AppProperties properties, DataStore dataStore, Sm4Cipher sm4Cipher) {
         this.properties = properties;
@@ -74,6 +80,7 @@ public class EncryptService {
                 properties.getOutputBufferBytes(),
                 properties.getAsyncWriteQueueSlots(),
                 properties.getAsyncWriteWorkerThreads());
+        this.callbackDispatcher = new CallbackDispatcher();
     }
 
     public void submit(EncryptRequest request) {
@@ -101,6 +108,7 @@ public class EncryptService {
     public void shutdown() {
         executor.shutdown();
         asyncWriter.close();
+        callbackDispatcher.close();
     }
 
     private void callback(String callbackRequestId, String callbackIp) throws IOException {
@@ -158,7 +166,6 @@ public class EncryptService {
             Sm4Cipher.Context cipher = sm4Cipher.newContext(sm4Key);
             FixedCipherCache[] caches = new FixedCipherCache[FieldId.FIELD_COUNT];
             byte[] cellBuffer = new byte[256];
-            byte[] rowBuffer = new byte[2048];
             RequestState state = asyncWriter.createState(
                     requestId,
                     sm4Key == null ? 0 : sm4Key.length(),
@@ -168,39 +175,15 @@ public class EncryptService {
                     output,
                     startNanos,
                     doCallback);
+            if (doCallback) {
+                callbackDispatcher.beginRequest();
+            }
             BufferChunk chunk = takeChunk(state);
             ByteBuffer buffer = chunk.buffer;
-            buffer.clear();
             boolean append = false;
             try {
                 for (int row = 0; row < data.rows(); row++) {
-                    int rowLength = 0;
-                    for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
-                        if (fieldIndex > 0) {
-                            rowBuffer = ensureCapacity(rowBuffer, rowLength + 1);
-                            rowBuffer[rowLength++] = (byte) ',';
-                        }
-
-                        int fieldId = fields[fieldIndex];
-                        ColumnData column = data.column(fieldId);
-                        byte[] bytes = column.bytes();
-                        int offset = column.offset(row);
-                        int length = column.length(row);
-
-                        if (FieldId.isMaskField(fieldId)) {
-                            rowBuffer = ensureCapacity(rowBuffer, rowLength + length + 1);
-                            System.arraycopy(bytes, offset, rowBuffer, rowLength, length);
-                            rowLength += length;
-                        } else {
-                            int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer);
-                            rowBuffer = ensureCapacity(rowBuffer, rowLength + hexLength + 1);
-                            System.arraycopy(cellBuffer, 0, rowBuffer, rowLength, hexLength);
-                            rowLength += hexLength;
-                        }
-                    }
-
-                    rowBuffer = ensureCapacity(rowBuffer, rowLength + 1);
-                    rowBuffer[rowLength++] = (byte) '\n';
+                    int rowLength = estimateRowLength(data, row);
                     if (rowLength > buffer.capacity()) {
                         throw new IOException("Output row exceeded direct buffer capacity for request " + requestId
                                 + ", required more than " + properties.getOutputBufferBytes() + " bytes");
@@ -210,17 +193,55 @@ public class EncryptService {
                         append = true;
                         chunk = takeChunk(state);
                         buffer = chunk.buffer;
-                        buffer.clear();
                     }
-                    buffer.put(rowBuffer, 0, rowLength);
+                    for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
+                        if (fieldIndex > 0) {
+                            buffer.put((byte) ',');
+                        }
+
+                        int fieldId = fields[fieldIndex];
+                        ColumnData column = data.column(fieldId);
+                        byte[] bytes = column.bytes();
+                        int offset = column.offset(row);
+                        int length = column.length(row);
+
+                        if (FieldId.isMaskField(fieldId)) {
+                            buffer.put(bytes, offset, length);
+                        } else {
+                            int hexLength = encryptCell(fieldId, cipher, caches, bytes, offset, length, cellBuffer);
+                            buffer.put(cellBuffer, 0, hexLength);
+                        }
+                    }
+                    buffer.put((byte) '\n');
                 }
                 return asyncWriter.submit(state, chunk, append, true);
             } catch (IOException e) {
-                chunk.buffer.clear();
                 asyncWriter.recycle(chunk);
+                if (state.markCallbackSettled()) {
+                    callbackDispatcher.failRequest();
+                }
                 state.completion.completeExceptionally(e);
                 throw e;
             }
+        }
+
+        private int estimateRowLength(LoadedData data, int row) {
+            int rowLength = 1;
+            for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
+                if (fieldIndex > 0) {
+                    rowLength++;
+                }
+                int fieldId = fields[fieldIndex];
+                ColumnData column = data.column(fieldId);
+                int length = column.length(row);
+                rowLength += FieldId.isMaskField(fieldId) ? length : encryptedHexLength(length);
+            }
+            return rowLength;
+        }
+
+        private int encryptedHexLength(int plainLength) {
+            int paddedBytes = ((plainLength >>> 4) + 1) << 4;
+            return paddedBytes << 1;
         }
 
         private BufferChunk takeChunk(RequestState state) throws IOException {
@@ -244,19 +265,6 @@ public class EncryptService {
                 }
                 throw new IOException("Failed while waiting for file write completion", cause);
             }
-        }
-
-        private byte[] ensureCapacity(byte[] buffer, int required) {
-            if (required <= buffer.length) {
-                return buffer;
-            }
-            int next = buffer.length;
-            while (next < required) {
-                next <<= 1;
-            }
-            byte[] expanded = new byte[next];
-            System.arraycopy(buffer, 0, expanded, 0, buffer.length);
-            return expanded;
         }
 
         private int encryptCell(int fieldId, Sm4Cipher.Context cipher, FixedCipherCache[] caches,
@@ -321,6 +329,7 @@ public class EncryptService {
             if (chunk == null) {
                 return;
             }
+            chunk.writtenBytes = 0;
             chunk.buffer.clear();
             available.offer(chunk);
         }
@@ -334,6 +343,7 @@ public class EncryptService {
         private CompletableFuture<Path> submit(RequestState state, BufferChunk chunk, boolean append, boolean lastChunk) throws IOException {
             ensureHealthy();
             try {
+                chunk.seal();
                 workers.get(state.writerIndex).pending.put(new WriteTask(state, chunk, append, lastChunk));
                 return state.completion;
             } catch (InterruptedException e) {
@@ -363,7 +373,7 @@ public class EncryptService {
         }
 
         private void writeTask(WriteTask task) throws IOException {
-            ByteBuffer buffer = task.chunk.buffer;
+            ByteBuffer buffer = task.chunk.readView();
             try {
                 long openStartNanos = System.nanoTime();
                 task.state.chunkCount.incrementAndGet();
@@ -373,7 +383,6 @@ public class EncryptService {
                         StandardOpenOption.WRITE,
                         task.append ? StandardOpenOption.APPEND : StandardOpenOption.TRUNCATE_EXISTING)) {
                     task.state.openNanos.addAndGet(System.nanoTime() - openStartNanos);
-                    buffer.flip();
                     long writeStartNanos = System.nanoTime();
                     while (buffer.hasRemaining()) {
                         channel.write(buffer);
@@ -393,12 +402,15 @@ public class EncryptService {
                             TimeUnit.NANOSECONDS.toMillis(task.state.takeChunkWaitNanos.get()),
                             TimeUnit.NANOSECONDS.toMillis(task.state.openNanos.get()),
                             TimeUnit.NANOSECONDS.toMillis(task.state.writeNanos.get()));
-                    if (task.state.doCallback) {
-                        callback(task.state.requestId, task.state.ip);
+                    if (task.state.doCallback && task.state.markCallbackSettled()) {
+                        callbackDispatcher.submit(task.state.requestId, task.state.ip);
                     }
                     task.state.completion.complete(task.state.output);
                 }
             } catch (IOException e) {
+                if (task.state != null && task.state.markCallbackSettled()) {
+                    callbackDispatcher.failRequest();
+                }
                 task.state.completion.completeExceptionally(e);
                 throw e;
             } finally {
@@ -413,6 +425,9 @@ public class EncryptService {
                     recycle(task.chunk);
                 }
                 if (task.state != null) {
+                    if (task.state.markCallbackSettled()) {
+                        callbackDispatcher.failRequest();
+                    }
                     task.state.completion.completeExceptionally(failure != null ? failure : new IOException("Writer stopped"));
                 }
             }
@@ -449,9 +464,94 @@ public class EncryptService {
 
     private static final class BufferChunk {
         private final ByteBuffer buffer;
+        private int writtenBytes;
 
         private BufferChunk(ByteBuffer buffer) {
             this.buffer = buffer;
+        }
+
+        private void seal() {
+            writtenBytes = buffer.position();
+        }
+
+        private ByteBuffer readView() {
+            ByteBuffer view = buffer.duplicate();
+            view.position(0);
+            view.limit(writtenBytes);
+            return view;
+        }
+    }
+
+    private final class CallbackDispatcher implements Closeable {
+        private final Queue<CallbackTask> pending = new ConcurrentLinkedQueue<>();
+        private final ExecutorService executor;
+        private final AtomicInteger activeRequests = new AtomicInteger();
+
+        private CallbackDispatcher() {
+            int threads = Math.max(1, properties.getAsyncWriteWorkerThreads());
+            this.executor = Executors.newFixedThreadPool(threads, runnable -> {
+                Thread thread = new Thread(runnable, "dcc-callback-dispatcher");
+                thread.setDaemon(true);
+                return thread;
+            });
+        }
+
+        private void beginRequest() {
+            if (!isEnabled()) {
+                return;
+            }
+            activeRequests.incrementAndGet();
+        }
+
+        private void submit(String requestId, String ip) {
+            if (!isEnabled()) {
+                return;
+            }
+            pending.offer(new CallbackTask(requestId, ip));
+            flushIfIdle(activeRequests.decrementAndGet());
+        }
+
+        private void failRequest() {
+            if (!isEnabled()) {
+                return;
+            }
+            flushIfIdle(activeRequests.decrementAndGet());
+        }
+
+        private boolean isEnabled() {
+            String callbackUrl = properties.getCallbackUrl();
+            return callbackUrl != null && !callbackUrl.isEmpty();
+        }
+
+        private void flushIfIdle(int remaining) {
+            if (remaining != 0) {
+                return;
+            }
+            CallbackTask task;
+            while ((task = pending.poll()) != null) {
+                CallbackTask callbackTask = task;
+                executor.execute(() -> {
+                    try {
+                        callback(callbackTask.requestId, callbackTask.ip);
+                    } catch (IOException e) {
+                        log.error("Callback failed for requestId={}", callbackTask.requestId, e);
+                    }
+                });
+            }
+        }
+
+        @Override
+        public void close() {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(properties.getRequestTimeoutMillis(), TimeUnit.MILLISECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while closing callback dispatcher", e);
+            }
         }
     }
 
@@ -484,6 +584,7 @@ public class EncryptService {
         private final AtomicLong takeChunkWaitNanos = new AtomicLong();
         private final AtomicLong openNanos = new AtomicLong();
         private final AtomicLong writeNanos = new AtomicLong();
+        private final AtomicBoolean callbackSettled = new AtomicBoolean();
 
         private RequestState(String requestId, int keyLength, int fieldCount, int rows,
                              String ip, Path output, long startNanos,
@@ -498,6 +599,10 @@ public class EncryptService {
             this.doCallback = doCallback;
             this.writerIndex = writerIndex;
         }
+
+        private boolean markCallbackSettled() {
+            return doCallback && callbackSettled.compareAndSet(false, true);
+        }
     }
 
     private static final class WriteTask {
@@ -511,6 +616,16 @@ public class EncryptService {
             this.chunk = chunk;
             this.append = append;
             this.lastChunk = lastChunk;
+        }
+    }
+
+    private static final class CallbackTask {
+        private final String requestId;
+        private final String ip;
+
+        private CallbackTask(String requestId, String ip) {
+            this.requestId = requestId;
+            this.ip = ip;
         }
     }
 }

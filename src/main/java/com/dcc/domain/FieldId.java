@@ -13,7 +13,7 @@ public final class FieldId {
     public static final int TRANS_ID = 9;
     public static final int SECRET_CODE = 10;
     public static final int FIELD_COUNT = 11;
-    public static final int MAX_REQUEST_FIELDS = 8;
+    public static final int MAX_REQUEST_FIELDS = FIELD_COUNT;
 
     private FieldId() {
     }
